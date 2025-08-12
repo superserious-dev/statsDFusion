@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::future::Future;
 
 pub mod cli;
+pub mod metric_parser;
 pub mod metrics_store;
 pub mod service_manager;
 pub mod udp_server;
