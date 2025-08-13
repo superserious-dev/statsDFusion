@@ -3,7 +3,7 @@ use clap::Parser as _;
 use log::info;
 use statsdfusion::{
     cli, metrics_store,
-    service_manager::{ServiceManager, ServiceManagerConfig},
+    startup::{StartupConfig, start_services},
     udp_server,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -24,12 +24,18 @@ async fn main() -> Result<()> {
     ) = mpsc::unbounded_channel();
 
     // Spin up services
-    let udp_server =
+    let mut udp_server =
         udp_server::UdpServer::new(args.udp_port, args.flush_interval, metrics_store_tx);
-    let metrics_store = metrics_store::MetricsStore::new(args.data_dir, metrics_store_rx);
-    let mut service_manager =
-        ServiceManager::new(metrics_store, udp_server, ServiceManagerConfig::default());
-    service_manager.start_services().await?;
+    let mut metrics_store = metrics_store::MetricsStore::new(args.data_dir, metrics_store_rx);
+    let running_services = start_services(
+        &mut metrics_store,
+        &mut udp_server,
+        StartupConfig::default(),
+    )
+    .await?;
+
+    // Block until services shut down
+    running_services.wait_until_shutdown().await?;
 
     info!("Stopped statsDFusion.");
 

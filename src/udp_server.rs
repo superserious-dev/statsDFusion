@@ -1,7 +1,7 @@
 use crate::{Service, metrics_store};
 use anyhow::{Context as _, Result};
 use chrono::{Timelike as _, Utc};
-use log::info;
+use log::{error, info};
 use std::time::Duration;
 use std::{
     future::Future,
@@ -12,6 +12,7 @@ use std::{
     },
 };
 use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedSender, task::spawn_blocking, time};
+use tokio_util::sync::CancellationToken;
 
 const MAX_RECEIVE_BUFFER_BYTES: usize = 10_000;
 
@@ -38,7 +39,10 @@ impl UdpServer {
 }
 
 impl Service for UdpServer {
-    fn service(&mut self) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn service(
+        &mut self,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
         let port = self.port;
         let is_ready = Arc::clone(&self.is_ready);
         let mut flush_interval = time::interval(Duration::from_secs(self.flush_interval));
@@ -56,9 +60,15 @@ impl Service for UdpServer {
             is_ready.store(true, Ordering::SeqCst);
             loop {
                 select! {
+                    _ = cancellation_token.cancelled() => {
+                        info!("Shutting down UdpServer...");
+                        break
+                    }
+
                     // Receive bytes from UDP
                     Ok((len, _addr)) = socket.recv_from(&mut buf)
                     => {
+
                         // Convert bytes to string
                         let message = str::from_utf8(&buf[..len])?;
 
@@ -76,6 +86,7 @@ impl Service for UdpServer {
                     }
                 }
             }
+            Ok(())
         }
     }
 

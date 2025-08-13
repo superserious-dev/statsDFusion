@@ -9,7 +9,9 @@ chrono = "0.4.41"
 chumsky = "0.10.1"
 clap = { version = "4.5.43", features = ["derive"] }
 env_logger = { version = "0.11.8", features = ["humantime", "auto-color"] }
+futures = "0.3.31"
 log = "0.4.27"
 tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = { version = "0.7.16", features = ["rt"] }
 
 [dev-dependencies]

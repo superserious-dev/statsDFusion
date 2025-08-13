@@ -1,5 +1,6 @@
 use crate::Service;
 use anyhow::Result;
+use log::info;
 use std::{
     path::PathBuf,
     sync::{
@@ -7,7 +8,8 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::{select, sync::mpsc::UnboundedReceiver};
+use tokio_util::sync::CancellationToken;
 
 pub enum Message {}
 
@@ -28,15 +30,20 @@ impl MetricsStore {
 }
 
 impl Service for MetricsStore {
-    fn service(&mut self) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn service(
+        &mut self,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
         let is_ready = Arc::clone(&self.is_ready);
         let data_dir = self.data_dir.to_string_lossy().to_string();
         async move {
             is_ready.store(true, Ordering::SeqCst);
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                println!("data dir is: `{data_dir}`");
+            select! {
+                _ = cancellation_token.cancelled() => {
+                    info!("Shutting down MetricsStore...");
+                }
             }
+            Ok(())
         }
     }
 

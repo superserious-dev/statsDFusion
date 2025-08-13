@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use statsdfusion::{
-    Service, metrics_store::MetricsStoreService, service_manager::ServiceManagerConfig,
+    Service, metrics_store::MetricsStoreService, startup::StartupConfig,
     udp_server::UdpServerService,
 };
 use std::{
@@ -10,7 +10,8 @@ use std::{
     },
     time::Duration,
 };
-use tokio::time::sleep;
+use tokio::{select, time::sleep};
+use tokio_util::sync::CancellationToken;
 
 const STANDARD_STARTUP_DELAY_SEC: f64 = 0.01;
 
@@ -39,7 +40,10 @@ impl TestMetricsStore {
 }
 
 impl Service for TestMetricsStore {
-    fn service(&mut self) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+    fn service(
+        &mut self,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
         let is_ready = Arc::clone(&self.is_ready);
         let should_fail = self.should_fail;
         let startup_delay = self.startup_delay;
@@ -50,7 +54,14 @@ impl Service for TestMetricsStore {
             if !should_fail {
                 is_ready.store(true, Ordering::SeqCst);
                 loop {
-                    sleep(Duration::from_secs(1)).await;
+                    select! {
+                       _ = cancellation_token.cancelled() => {
+                           break Ok(())
+                       }
+                       _ = sleep(Duration::from_secs(1)) => {
+
+                       }
+                    }
                 }
             } else {
                 bail!("failure");
@@ -90,7 +101,10 @@ impl TestUdpServer {
 }
 
 impl Service for TestUdpServer {
-    fn service(&mut self) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+    fn service(
+        &mut self,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
         let is_ready = Arc::clone(&self.is_ready);
         let should_fail = self.should_fail;
         let startup_delay = self.startup_delay;
@@ -100,9 +114,9 @@ impl Service for TestUdpServer {
 
             if !should_fail {
                 is_ready.store(true, Ordering::SeqCst);
-                loop {
-                    sleep(Duration::from_secs(1)).await;
-                }
+                sleep(Duration::from_secs(1)).await;
+                cancellation_token.cancel(); // Cancel without error after one iteration
+                Ok(())
             } else {
                 bail!("failure");
             }
@@ -119,81 +133,66 @@ impl UdpServerService for TestUdpServer {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use statsdfusion::service_manager::ServiceManager;
-    use tokio::time::{error::Elapsed, timeout};
+    use statsdfusion::startup::start_services;
 
-    fn service_manager_config() -> ServiceManagerConfig {
-        ServiceManagerConfig::new(3, Duration::from_millis(10))
+    fn startup_config() -> StartupConfig {
+        StartupConfig::new(3, Duration::from_millis(10))
     }
 
-    /// Both services should start up and run "indefinitely".
-    /// For the purposes of this test, assume that "running indefinitely"
-    ///   means that the services run for some amount of time without failing
+    /// For the purposes of this test, the services should start up, then gracefully
+    /// shutdown and return with no errors.
     #[tokio::test]
     async fn test_both_services_start() {
-        const INDEFINITE_RUN_SEC: f64 = 0.5;
-        let metrics_store = TestMetricsStore::new_working();
-        let udp_server = TestUdpServer::new_working();
+        let mut metrics_store = TestMetricsStore::new_working();
+        let mut udp_server = TestUdpServer::new_working();
 
-        let mut service_manager =
-            ServiceManager::new(metrics_store, udp_server, service_manager_config());
-
-        let result = timeout(
-            Duration::from_secs_f64(INDEFINITE_RUN_SEC),
-            service_manager.start_services(),
-        )
-        .await;
-
-        // If there was a timeout, that means the services successfully started.
-        // Otherwise, there would be some other error.
-        assert!(matches!(result, Err(Elapsed { .. })));
+        let running_services =
+            start_services(&mut metrics_store, &mut udp_server, startup_config())
+                .await
+                .unwrap();
+        let result = running_services.wait_until_shutdown().await;
+        assert!(matches!(result, Ok(())));
     }
 
     /// Should error if the UDP Server does not start after the Metrics Store
     #[tokio::test]
     async fn test_metrics_store_starts_but_udp_server_fails() {
-        let metrics_store = TestMetricsStore::new_working();
-        let udp_server = TestUdpServer::new_failing();
+        let mut metrics_store = TestMetricsStore::new_working();
+        let mut udp_server = TestUdpServer::new_failing();
 
-        let mut service_manager =
-            ServiceManager::new(metrics_store, udp_server, service_manager_config());
+        let running_services =
+            start_services(&mut metrics_store, &mut udp_server, startup_config()).await;
 
-        let result = service_manager.start_services().await;
-
-        assert!(result.is_err());
-        let error_message = result.unwrap_err().to_string();
+        assert!(running_services.is_err());
+        let error_message = running_services.unwrap_err().to_string();
         assert!(error_message.contains("Failed to start UDP server"));
     }
 
     /// Should error if the Metrics Store does not start immediately
     #[tokio::test]
     async fn test_metrics_store_fails_to_start() {
-        let metrics_store = TestMetricsStore::new_failing();
-        let udp_server = TestUdpServer::new_working();
+        let mut metrics_store = TestMetricsStore::new_failing();
+        let mut udp_server = TestUdpServer::new_working();
 
-        let mut service_manager =
-            ServiceManager::new(metrics_store, udp_server, service_manager_config());
+        let running_services =
+            start_services(&mut metrics_store, &mut udp_server, startup_config()).await;
 
-        let result = service_manager.start_services().await;
-
-        assert!(result.is_err());
-        let error_message = result.unwrap_err().to_string();
+        assert!(running_services.is_err());
+        let error_message = running_services.unwrap_err().to_string();
         assert!(error_message.contains("Failed to start metrics store"));
     }
 
     /// Should error if the Metrics Store does not start before the max retry count has been reached
     #[tokio::test]
     async fn test_metrics_store_insufficient_retries_for_slow_startup() {
-        let metrics_store = TestMetricsStore::new(false, Duration::from_millis(200)); // startup delay > total retry duration
-        let udp_server = TestUdpServer::new_working();
+        let mut metrics_store = TestMetricsStore::new(false, Duration::from_millis(200)); // startup delay > total retry duration
+        let mut udp_server = TestUdpServer::new_working();
 
-        let mut service_manager =
-            ServiceManager::new(metrics_store, udp_server, service_manager_config());
+        let running_services =
+            start_services(&mut metrics_store, &mut udp_server, startup_config()).await;
 
-        let result = service_manager.start_services().await;
-
-        assert!(result.is_err());
-        let error_message = result.unwrap_err().to_string();
+        assert!(running_services.is_err());
+        let error_message = running_services.unwrap_err().to_string();
         assert!(error_message.contains("Failed to start metrics store"));
     }
 }
