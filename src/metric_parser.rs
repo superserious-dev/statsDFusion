@@ -70,7 +70,7 @@ impl Metric {
         // ***
 
         let name = any()
-            .filter(|c: &char| c.is_alphabetic() || ['.', '-', '_'].contains(c))
+            .filter(|c: &char| c.is_alphanumeric() || ['.', '-', '_'].contains(c))
             .repeated()
             .to_slice()
             .filter(|n: &&str| !n.is_empty())
@@ -189,6 +189,15 @@ mod tests {
                 parse_packet("metric:1|c"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
+                    tags: vec![],
+                    value: MetricValue::Constant(1)
+                }]
+            );
+
+            assert_eq!(
+                parse_packet("met_ric-0:1|c"),
+                vec![Metric::CounterMetric {
+                    name: "met_ric-0".to_string(),
                     tags: vec![],
                     value: MetricValue::Constant(1)
                 }]
@@ -332,6 +341,15 @@ mod tests {
                 parse_packet("metric:1|g"),
                 vec![Metric::GaugeMetric {
                     name: "metric".to_string(),
+                    tags: vec![],
+                    value: MetricValue::Constant(1.)
+                }]
+            );
+
+            assert_eq!(
+                parse_packet("met_ric-0:1|g"),
+                vec![Metric::GaugeMetric {
+                    name: "met_ric-0".to_string(),
                     tags: vec![],
                     value: MetricValue::Constant(1.)
                 }]
