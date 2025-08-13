@@ -7,7 +7,7 @@ use chumsky::{
     span::SimpleSpan,
     text,
 };
-use std::{fmt::Debug, ops::Div};
+use std::{collections::BTreeSet, fmt::Debug, ops::Div};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MetricValue<V: Debug + PartialEq> {
@@ -15,7 +15,7 @@ pub enum MetricValue<V: Debug + PartialEq> {
     Delta(V),
 }
 
-pub type Tags = Vec<(String, Option<String>)>;
+pub type Tags = BTreeSet<(String, Option<String>)>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Metric {
@@ -131,11 +131,11 @@ impl Metric {
         ))
     }
 
-    pub fn new_counter(
+    fn new_counter(
         name: String,
         value: MetricValue<i64>,
         sample_rate: Option<f64>,
-        tags: Option<Vec<(String, Option<String>)>>,
+        tags: Option<Tags>,
     ) -> Self {
         let sampler = |value| (value as f64).div(sample_rate.unwrap_or(1f64)).floor() as i64;
         let sampled_value = match value {
@@ -150,11 +150,7 @@ impl Metric {
         }
     }
 
-    pub fn new_gauge(
-        name: String,
-        value: MetricValue<f64>,
-        tags: Option<Vec<(String, Option<String>)>>,
-    ) -> Self {
+    fn new_gauge(name: String, value: MetricValue<f64>, tags: Option<Tags>) -> Self {
         Metric::GaugeMetric {
             name,
             value,
@@ -189,7 +185,7 @@ mod tests {
                 parse_packet("metric:1|c"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(1)
                 }]
             );
@@ -198,7 +194,7 @@ mod tests {
                 parse_packet("met_ric-0:1|c"),
                 vec![Metric::CounterMetric {
                     name: "met_ric-0".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(1)
                 }]
             );
@@ -210,7 +206,7 @@ mod tests {
                 parse_packet("metric:+1|c"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Delta(1)
                 }]
             );
@@ -221,7 +217,7 @@ mod tests {
                 parse_packet("metric:-1|c"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Delta(-1)
                 }]
             );
@@ -233,7 +229,7 @@ mod tests {
                 parse_packet("metric:1|c|@0.5"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(2)
                 }]
             );
@@ -245,7 +241,7 @@ mod tests {
                 parse_packet("metric:17|c|@0.4"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(42)
                 }]
             );
@@ -257,10 +253,10 @@ mod tests {
                 parse_packet("metric:1|c|@0.5|#tag1,tag2_key:tag2_value"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
-                    tags: vec![
+                    tags: Tags::from([
                         ("tag1".to_owned(), None),
                         ("tag2_key".to_owned(), Some("tag2_value".to_owned()))
-                    ],
+                    ]),
                     value: MetricValue::Constant(2)
                 }]
             );
@@ -272,10 +268,10 @@ mod tests {
                 parse_packet("metric:1|c|#tag1,tag2_key:tag2_value"),
                 vec![Metric::CounterMetric {
                     name: "metric".to_string(),
-                    tags: vec![
+                    tags: Tags::from([
                         ("tag1".to_owned(), None),
                         ("tag2_key".to_owned(), Some("tag2_value".to_owned()))
-                    ],
+                    ]),
                     value: MetricValue::Constant(1)
                 }]
             );
@@ -287,7 +283,7 @@ mod tests {
                 parse_packet("a.metric:1|c"),
                 vec![Metric::CounterMetric {
                     name: "a.metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(1)
                 }]
             );
@@ -341,7 +337,7 @@ mod tests {
                 parse_packet("metric:1|g"),
                 vec![Metric::GaugeMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(1.)
                 }]
             );
@@ -350,7 +346,7 @@ mod tests {
                 parse_packet("met_ric-0:1|g"),
                 vec![Metric::GaugeMetric {
                     name: "met_ric-0".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(1.)
                 }]
             );
@@ -362,7 +358,7 @@ mod tests {
                 parse_packet("metric:1.2|g"),
                 vec![Metric::GaugeMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(1.2)
                 }]
             );
@@ -374,7 +370,7 @@ mod tests {
                 parse_packet("metric:+1|g"),
                 vec![Metric::GaugeMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Delta(1.)
                 }]
             );
@@ -385,7 +381,7 @@ mod tests {
                 parse_packet("metric:-1|g"),
                 vec![Metric::GaugeMetric {
                     name: "metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Delta(-1.)
                 }]
             );
@@ -402,10 +398,10 @@ mod tests {
                 parse_packet("metric:1|g|#tag1,tag2_key:tag2_value"),
                 vec![Metric::GaugeMetric {
                     name: "metric".to_string(),
-                    tags: vec![
+                    tags: Tags::from([
                         ("tag1".to_owned(), None),
                         ("tag2_key".to_owned(), Some("tag2_value".to_owned()))
-                    ],
+                    ]),
                     value: MetricValue::Constant(1.)
                 }]
             );
@@ -417,7 +413,7 @@ mod tests {
                 parse_packet("a.metric:1|g"),
                 vec![Metric::GaugeMetric {
                     name: "a.metric".to_string(),
-                    tags: vec![],
+                    tags: Tags::new(),
                     value: MetricValue::Constant(1.)
                 }]
             );
@@ -456,15 +452,30 @@ mod tests {
                 vec![
                     Metric::CounterMetric {
                         name: "counter_metric".to_string(),
-                        tags: vec![],
+                        tags: Tags::new(),
                         value: MetricValue::Constant(1)
                     },
                     Metric::GaugeMetric {
                         name: "gauge_metric".to_string(),
-                        tags: vec![],
+                        tags: Tags::new(),
                         value: MetricValue::Constant(1.23)
                     },
                 ]
+            );
+        }
+
+        #[test]
+        fn test_duplicate_tags() {
+            assert_eq!(
+                parse_packet("metric:1|g|#tag1,tag2_key:tag2_value,tag1,tag2_key:tag2_value"),
+                vec![Metric::GaugeMetric {
+                    name: "metric".to_string(),
+                    tags: Tags::from([
+                        ("tag1".to_owned(), None),
+                        ("tag2_key".to_owned(), Some("tag2_value".to_owned()))
+                    ]),
+                    value: MetricValue::Constant(1.)
+                }]
             );
         }
 
