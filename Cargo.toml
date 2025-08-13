@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+arrow = "56.0.0"
 chrono = "0.4.41"
 chumsky = "0.10.1"
 clap = { version = "4.5.43", features = ["derive"] }

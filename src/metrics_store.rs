@@ -1,5 +1,6 @@
 use crate::Service;
 use anyhow::Result;
+use arrow::ipc::reader::StreamReader;
 use log::info;
 use std::{
     path::PathBuf,
@@ -11,12 +12,16 @@ use std::{
 use tokio::{select, sync::mpsc::UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
 
-pub enum Message {}
+#[derive(Debug)]
+pub enum Message {
+    Counters(Vec<u8>),
+    Gauges(Vec<u8>),
+}
 
 pub struct MetricsStore {
     is_ready: Arc<AtomicBool>,
     data_dir: PathBuf,
-    rx: UnboundedReceiver<Message>,
+    rx: Option<UnboundedReceiver<Message>>,
 }
 
 impl MetricsStore {
@@ -24,7 +29,7 @@ impl MetricsStore {
         Self {
             is_ready: Arc::new(AtomicBool::new(false)),
             data_dir,
-            rx,
+            rx: Some(rx),
         }
     }
 }
@@ -36,14 +41,32 @@ impl Service for MetricsStore {
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let is_ready = Arc::clone(&self.is_ready);
         let data_dir = self.data_dir.to_string_lossy().to_string();
+        let mut rx = std::mem::take(&mut self.rx).unwrap();
+
         async move {
             is_ready.store(true, Ordering::SeqCst);
-            select! {
-                _ = cancellation_token.cancelled() => {
-                    info!("Shutting down MetricsStore...");
+            loop {
+                select! {
+                    _ = cancellation_token.cancelled() => {
+                        info!("Shutting down MetricsStore...");
+                        break Ok(())
+                    }
+                    message = rx.recv()
+                    => {
+                        if let Some(message) = message {
+                           match message{
+                               Message::Counters(bytes) | Message::Gauges(bytes) => {
+                                   let cursor = std::io::Cursor::new(bytes);
+                                   let reader = StreamReader::try_new(cursor, None)?;
+                                   for batch in reader {
+                                       let batch = batch?;
+                                   }
+                               }
+                           }
+                        }
+                    }
                 }
             }
-            Ok(())
         }
     }
 
