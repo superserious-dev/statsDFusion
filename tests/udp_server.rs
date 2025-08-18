@@ -332,7 +332,7 @@ mod tests {
         // Note the `~` means that nothing was sent for the metric in this interval
 
         // COUNTERS
-        // NAME,      FI1,  FI2,  AGGREGATE
+        // NAME,      FI1,  FI2,  EXPECTED
         // metric1,   10,    7,    7
         // metric2,   10,    ~,    0
         // metric3,   10,   -7,    0
