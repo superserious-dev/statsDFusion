@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 pub mod cli;
 pub mod metric;
 pub mod metrics_store;
+pub mod redb_table_provider;
 pub mod startup;
 pub mod udp_server;
 
