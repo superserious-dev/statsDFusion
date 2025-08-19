@@ -7,7 +7,8 @@ use chumsky::{
     span::SimpleSpan,
     text,
 };
-use std::{collections::BTreeSet, fmt::Debug, ops::Div};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use std::{collections::BTreeSet, fmt::Debug, ops::Div, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MetricValue<V: Debug + PartialEq> {
@@ -170,6 +171,59 @@ pub fn parse_packet(packet: &str) -> Vec<Metric> {
         }
     }
     metrics
+}
+
+pub mod schema_fields {
+    use super::*;
+
+    pub fn name_field() -> Field {
+        Field::new("name", DataType::Utf8, false)
+    }
+
+    pub fn tags_field() -> Field {
+        Field::new_map(
+            "tags",
+            "entries",
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", DataType::Utf8, true),
+            false,
+            false,
+        )
+    }
+
+    pub fn flushed_at_field() -> Field {
+        Field::new(
+            "flushed_at",
+            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+            false,
+        )
+    }
+
+    pub fn counter_value_field() -> Field {
+        Field::new("value", DataType::Int64, false)
+    }
+
+    pub fn gauge_value_field() -> Field {
+        Field::new("value", DataType::Float64, false)
+    }
+
+    pub fn counters_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            name_field(),
+            counter_value_field(),
+            tags_field(),
+            flushed_at_field(),
+        ]))
+    }
+
+    pub fn gauges_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            name_field(),
+            gauge_value_field(),
+            tags_field(),
+            flushed_at_field(),
+        ]))
+    }
 }
 
 #[cfg(test)]

@@ -1,11 +1,13 @@
 use anyhow::Result;
-use arrow::array::{Array, Float64Array, Int64Array, MapArray, RecordBatch, StringArray};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     decode::FlightRecordBatchStream,
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService, FlightServiceServer},
+};
+use datafusion::arrow::array::{
+    Array, Float64Array, Int64Array, MapArray, RecordBatch, StringArray,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt as _, TryStreamExt as _};

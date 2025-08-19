@@ -1,20 +1,20 @@
 use crate::{
     Service,
-    metric::{Metric, MetricValue, Tags, parse_packet},
+    metric::{Metric, MetricValue, Tags, parse_packet, schema_fields},
 };
 use anyhow::{Context as _, Result};
-use arrow::{
-    array::{
-        ArrayRef, Float64Builder, Int64Builder, MapBuilder, RecordBatch, StringBuilder,
-        TimestampSecondBuilder,
-    },
-    datatypes::{DataType, Field, Schema, TimeUnit},
-};
 use arrow_flight::{
     FlightClient, FlightDescriptor, PutResult,
     encode::{FlightDataEncoder, FlightDataEncoderBuilder},
 };
 use chrono::{DateTime, Timelike as _, Utc};
+use datafusion::arrow::{
+    array::{
+        ArrayRef, Float64Builder, Int64Builder, MapBuilder, RecordBatch, StringBuilder,
+        TimestampSecondBuilder,
+    },
+    datatypes::{DataType, Field, Schema},
+};
 use futures::{TryStreamExt, stream};
 use log::info;
 use std::{
@@ -175,20 +175,9 @@ impl FlushIntervalAggregates {
         metric_data: MetricData,
         flushed_at: DateTime<Utc>,
     ) -> Result<FlightDataEncoder> {
-        let names_schema = Field::new("name", DataType::Utf8, false);
-        let tags_schema = Field::new_map(
-            "tags",
-            "entries",
-            Field::new("keys", DataType::Utf8, false),
-            Field::new("values", DataType::Utf8, true),
-            false,
-            false,
-        );
-        let flushed_at_schema = Field::new(
-            "flushed_at",
-            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())), // UTC timezone offset
-            false,
-        );
+        let names_schema = schema_fields::name_field();
+        let tags_schema = schema_fields::tags_field();
+        let flushed_at_schema = schema_fields::flushed_at_field();
 
         let mut names_builder = StringBuilder::new();
         let mut tags_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
