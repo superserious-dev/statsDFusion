@@ -80,7 +80,8 @@ impl FlushIntervalAggregates {
                     } else {
                         match incoming_value {
                             MetricValue::Constant(rv) => rv,
-                            MetricValue::Delta(rv) => rv, // adding to an unset counter creates a new counter with value=delta
+                            // In the case where there is no previous value and the delta is negative, saturate at 0.
+                            MetricValue::Delta(rv) => rv.max(0), // adding to an unset counter creates a new counter with value=delta
                         }
                     };
                     self.counters.insert(key, new_raw_value);
@@ -106,12 +107,6 @@ impl FlushIntervalAggregates {
                     self.gauges.insert(key, new_raw_value);
                 }
             }
-        }
-    }
-
-    fn reset_counters(&mut self) {
-        for (_key, value) in self.counters.iter_mut() {
-            *value = 0;
         }
     }
 
@@ -241,8 +236,8 @@ impl FlushIntervalAggregates {
             metrics_store::Message::Counters(self.serialize_counters(flushed_at)?),
             metrics_store::Message::Gauges(self.serialize_gauges(flushed_at)?),
         ];
-        // Reset counters to 0 each flush interval
-        self.reset_counters();
+        // Delete counters after each flush interval
+        self.counters = HashMap::new();
         Ok(messages)
     }
 }

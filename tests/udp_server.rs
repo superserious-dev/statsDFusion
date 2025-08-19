@@ -334,7 +334,7 @@ mod tests {
         // COUNTERS
         // NAME,      FI1,  FI2,  EXPECTED
         // metric1,   10,    7,    7
-        // metric2,   10,    ~,    0
+        // metric2,   10,    ~,    ~
         // metric3,   10,   -7,    0
         // metric4,   ~,     7,    7
 
@@ -378,7 +378,6 @@ mod tests {
 
         let expected_counters = BTreeMap::from_iter(vec![
             (("metric1".into(), Tags::new()), 7),
-            (("metric2".into(), Tags::new()), 0),
             (("metric3".into(), Tags::new()), 0),
             (("metric4".into(), Tags::new()), 7),
         ]);
