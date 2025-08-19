@@ -1,4 +1,8 @@
-use crate::Service;
+use crate::{
+    Service,
+    metric::schema_fields::{counters_schema, gauges_schema},
+    redb_table_provider::RedbTable,
+};
 use anyhow::{Result, anyhow};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
@@ -7,17 +11,24 @@ use arrow_flight::{
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService, FlightServiceServer},
 };
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
+use datafusion::{
+    arrow::{array::RecordBatch, ipc::writer::StreamWriter},
+    datasource::TableProvider,
+    prelude::SessionContext,
+};
 use futures::{
     StreamExt as _, TryStreamExt as _,
     stream::{self, BoxStream},
 };
 use log::info;
+use redb::{Database, TableDefinition};
 use std::{
+    io::Cursor,
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -25,8 +36,60 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming, transport::Server};
 
+const HOT_METRICS_DB: &str = "hot_metrics.redb";
+pub const HOT_METRICS_TABLE_COUNTERS: &str = "counters";
+pub const HOT_METRICS_TABLE_GAUGES: &str = "gauges";
+
+const HOT_METRICS_TABLES: [&str; 2] = [HOT_METRICS_TABLE_COUNTERS, HOT_METRICS_TABLE_GAUGES];
+
 #[derive(Clone, Debug)]
-struct InnerFlightServer {}
+struct InnerFlightServer {
+    database: Arc<Mutex<Database>>,
+}
+
+impl InnerFlightServer {
+    fn batch_to_bytes(batch: &RecordBatch) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let cursor = Cursor::new(&mut buffer);
+
+        let mut writer = StreamWriter::try_new(cursor, &batch.schema())?;
+        writer.write(batch)?;
+        writer.finish()?;
+
+        Ok(buffer)
+    }
+
+    fn write_batch(
+        &self,
+        table_defintiton: TableDefinition<i64, Vec<u8>>,
+        flushed_at: DateTime<Utc>,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let bytes = Self::batch_to_bytes(batch).map_err(|e| Status::unknown(e.to_string()))?;
+
+        if let Ok(db) = self.database.lock() {
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(table_defintiton)?;
+                table.insert(flushed_at.timestamp(), bytes)?;
+            }
+            write_txn.commit()?;
+        }
+        Ok(())
+    }
+
+    fn write_counters_batch(&self, flushed_at: DateTime<Utc>, batch: &RecordBatch) -> Result<()> {
+        const COUNTERS_TABLE: TableDefinition<i64, Vec<u8>> =
+            TableDefinition::new(HOT_METRICS_TABLE_COUNTERS);
+        self.write_batch(COUNTERS_TABLE, flushed_at, batch)
+    }
+
+    fn write_gauges_batch(&self, flushed_at: DateTime<Utc>, batch: &RecordBatch) -> Result<()> {
+        const GAUGES_TABLE: TableDefinition<i64, Vec<u8>> =
+            TableDefinition::new(HOT_METRICS_TABLE_GAUGES);
+        self.write_batch(GAUGES_TABLE, flushed_at, batch)
+    }
+}
 
 #[tonic::async_trait]
 impl FlightService for InnerFlightServer {
@@ -110,8 +173,16 @@ impl FlightService for InnerFlightServer {
                     let flushed_at = DateTime::parse_from_rfc3339(&flight_descriptor.path[0])
                         .map_err(|_| {
                             Status::invalid_argument("Unable to parse flushed_at time".to_string())
-                        })?;
+                        })?
+                        .to_utc();
+
                     let table = flight_descriptor.path[1].clone();
+                    if !HOT_METRICS_TABLES.contains(&table.as_str()) {
+                        return Err(Status::invalid_argument(format!(
+                            "Table `{}` does not exist",
+                            table
+                        )));
+                    }
 
                     (flushed_at, table)
                 }
@@ -134,13 +205,13 @@ impl FlightService for InnerFlightServer {
         while let Some(batch) = record_batch_stream.next().await {
             match batch {
                 Ok(batch) => match table.as_str() {
-                    "counters" => {
-                        info!("Storing counter batch at {}", flushed_at);
-                        dbg!(&batch);
+                    HOT_METRICS_TABLE_COUNTERS => {
+                        self.write_counters_batch(flushed_at, &batch)
+                            .map_err(|e| Status::unknown(e.to_string()))?;
                     }
-                    "gauges" => {
-                        info!("Storing gauge batch at {}", flushed_at);
-                        dbg!(&batch);
+                    HOT_METRICS_TABLE_GAUGES => {
+                        self.write_gauges_batch(flushed_at, &batch)
+                            .map_err(|e| Status::unknown(e.to_string()))?;
                     }
                     _ => {
                         eprintln!("Unknown table type: {}", table);
@@ -203,12 +274,38 @@ impl Service for MetricsStore {
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let is_ready = Arc::clone(&self.is_ready);
-        let _data_dir = self.data_dir.to_string_lossy().to_string();
+        let data_dir = self.data_dir.clone();
         let flight_port = self.flight_port;
 
         async move {
+            let hot_metrics_path = &data_dir.join(HOT_METRICS_DB);
+            let db = Arc::new(Mutex::new(Database::create(hot_metrics_path)?));
+            let ctx = SessionContext::new();
+
+            let counters_schema = counters_schema();
+            let gauges_schema = gauges_schema();
+
+            let redb_counters_table = Arc::new(RedbTable::new(
+                db.clone(),
+                HOT_METRICS_TABLE_COUNTERS,
+                counters_schema,
+            )?);
+            let _ = ctx.register_table(
+                "counters",
+                Arc::clone(&redb_counters_table) as Arc<dyn TableProvider>,
+            );
+            let redb_gauges_table = Arc::new(RedbTable::new(
+                db.clone(),
+                HOT_METRICS_TABLE_GAUGES,
+                gauges_schema,
+            )?);
+            let _ = ctx.register_table(
+                "gauges",
+                Arc::clone(&redb_gauges_table) as Arc<dyn TableProvider>,
+            );
+
             let socket_addr = SocketAddr::from(([127, 0, 0, 1], flight_port));
-            let service = InnerFlightServer {};
+            let service = InnerFlightServer { database: db };
             let svc = FlightServiceServer::new(service);
 
             info!("Starting Flight server @ {socket_addr}");

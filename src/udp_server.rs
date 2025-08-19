@@ -1,6 +1,7 @@
 use crate::{
     Service,
     metric::{Metric, MetricValue, Tags, parse_packet, schema_fields},
+    metrics_store::{HOT_METRICS_TABLE_COUNTERS, HOT_METRICS_TABLE_GAUGES},
 };
 use anyhow::{Context as _, Result};
 use arrow_flight::{
@@ -67,8 +68,8 @@ impl<'m> MetricData<'m> {
 
     fn metric_type_name(&self) -> &'static str {
         match self {
-            MetricData::Counters(_) => "counters",
-            MetricData::Gauges(_) => "gauges",
+            MetricData::Counters(_) => HOT_METRICS_TABLE_COUNTERS,
+            MetricData::Gauges(_) => HOT_METRICS_TABLE_GAUGES,
         }
     }
 
