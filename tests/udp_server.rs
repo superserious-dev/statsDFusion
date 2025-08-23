@@ -1,36 +1,48 @@
 use anyhow::Result;
-use arrow::array::{Array, Float64Array, Int64Array, MapArray, StringArray};
-use arrow::{array::RecordBatch, ipc::reader::StreamReader};
-use statsdfusion::metrics_store::MetricsStoreService;
-use statsdfusion::{Service, metrics_store::Message};
+use arrow::array::{Array, Float64Array, Int64Array, MapArray, RecordBatch, StringArray};
+use arrow_flight::{
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    decode::FlightRecordBatchStream,
+    flight_descriptor::DescriptorType,
+    flight_service_server::{FlightService, FlightServiceServer},
+};
+use futures::stream::{self, BoxStream};
+use futures::{StreamExt as _, TryStreamExt as _};
 use statsdfusion::{
+    Service,
     metric::Tags,
-    metrics_store,
+    metrics_store::MetricsStoreService,
     startup::{StartupConfig, start_services},
     udp_server,
 };
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    net::SocketAddr,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::select;
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
+use tonic::{Request, Response, Status, Streaming, transport::Server};
 
 struct TestMetricsStore {
     is_ready: Arc<AtomicBool>,
-    record_batches: Arc<RwLock<Vec<RecordBatch>>>,
-    rx: Option<UnboundedReceiver<Message>>,
+    flight_port: u16,
+    counter_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
+    gauge_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
 }
 
 impl TestMetricsStore {
-    pub fn new(rx: UnboundedReceiver<Message>) -> Self {
+    pub fn new(flight_port: u16) -> Self {
         Self {
             is_ready: Arc::new(AtomicBool::new(false)),
-            record_batches: Arc::new(RwLock::new(vec![])),
-            rx: Some(rx),
+            flight_port,
+            counter_record_batches: Arc::new(RwLock::new(vec![])),
+            gauge_record_batches: Arc::new(RwLock::new(vec![])),
         }
     }
 }
@@ -41,33 +53,24 @@ impl Service for TestMetricsStore {
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let is_ready = Arc::clone(&self.is_ready);
-        let record_batches = Arc::clone(&self.record_batches);
-        let mut rx = std::mem::take(&mut self.rx).unwrap();
+        let counter_record_batches = Arc::clone(&self.counter_record_batches);
+        let gauge_record_batches = Arc::clone(&self.gauge_record_batches);
+        let flight_port = self.flight_port;
 
         async move {
-            is_ready.store(true, Ordering::SeqCst);
-            loop {
-                select! {
-                        _ = cancellation_token.cancelled() => {
-                            break
-                        }
+            let socket_addr = SocketAddr::from(([127, 0, 0, 1], flight_port));
+            let service = InnerFlightServer {
+                counter_record_batches: Arc::clone(&counter_record_batches),
+                gauge_record_batches: Arc::clone(&gauge_record_batches),
+            };
+            let svc = FlightServiceServer::new(service);
 
-                        message = rx.recv()
-                        => {
-                            if let Some(message) = message {
-                                match message {
-                                    Message::Counters(bytes) | Message::Gauges(bytes) => {
-                                        let cursor = std::io::Cursor::new(bytes);
-                                        let reader = StreamReader::try_new(cursor, None)?;
-                                        let mut batches = record_batches.write().unwrap();
-                                        for batch in reader {
-                                            batches.push(batch?);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                }
+            let server_future = Server::builder().add_service(svc).serve(socket_addr);
+
+            is_ready.store(true, Ordering::SeqCst);
+            select! {
+                _ = cancellation_token.cancelled() => { }
+                _ = server_future => { }
             }
 
             Ok(())
@@ -80,6 +83,146 @@ impl Service for TestMetricsStore {
 }
 
 impl MetricsStoreService for TestMetricsStore {}
+
+#[derive(Clone, Debug)]
+struct InnerFlightServer {
+    counter_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
+    gauge_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
+}
+
+#[tonic::async_trait]
+impl FlightService for InnerFlightServer {
+    type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
+    type ListFlightsStream = BoxStream<'static, Result<FlightInfo, Status>>;
+    type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
+    type DoPutStream = BoxStream<'static, Result<PutResult, Status>>;
+    type DoActionStream = BoxStream<'static, Result<arrow_flight::Result, Status>>;
+    type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
+    type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
+
+    async fn handshake(
+        &self,
+        _request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        Err(Status::unimplemented("Implement handshake"))
+    }
+
+    async fn list_flights(
+        &self,
+        _request: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+        Err(Status::unimplemented("Implement list_flights"))
+    }
+
+    async fn get_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Err(Status::unimplemented("Implement get_flight_info"))
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("Implement poll_flight_info"))
+    }
+
+    async fn get_schema(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        Err(Status::unimplemented("Implement get_schema"))
+    }
+
+    async fn do_get(
+        &self,
+        _request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        Err(Status::unimplemented("Implement do_get"))
+    }
+
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
+        let mut input_stream = request.into_inner();
+        let mut output = vec![];
+
+        let flight_data = input_stream.next().await.ok_or(Status::invalid_argument(
+            "No flight data received".to_string(),
+        ))??;
+        let flight_descriptor =
+            flight_data
+                .flight_descriptor
+                .as_ref()
+                .ok_or(Status::invalid_argument(
+                    "No flight descriptor found".to_string(),
+                ))?;
+
+        let table = match flight_descriptor.r#type() {
+            DescriptorType::Path => {
+                if flight_descriptor.path.len() != 2 {
+                    return Err(Status::invalid_argument(format!(
+                        "Path must have exactly 2 elements, got {}",
+                        flight_descriptor.path.len()
+                    )));
+                } else {
+                    flight_descriptor.path[1].clone()
+                }
+            }
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "Unexpected flight descriptor found: {flight_descriptor}"
+                )));
+            }
+        };
+
+        let stream_with_descriptor =
+            stream::once(futures::future::ready(Ok(flight_data))).chain(input_stream);
+
+        let mut record_batch_stream = FlightRecordBatchStream::new_from_flight_data(
+            stream_with_descriptor.map_err(|e| e.into()),
+        );
+
+        while let Some(batch) = record_batch_stream.next().await {
+            if let Ok(batch) = batch {
+                match table.as_str() {
+                    "counters" => self.counter_record_batches.write().unwrap().push(batch),
+                    "gauges" => self.gauge_record_batches.write().unwrap().push(batch),
+                    _ => unimplemented!(),
+                }
+            }
+        }
+
+        output.push(Ok(PutResult {
+            app_metadata: Default::default(),
+        }));
+
+        Ok(Response::new(Box::pin(stream::iter(output))))
+    }
+
+    async fn do_action(
+        &self,
+        _request: Request<Action>,
+    ) -> Result<Response<Self::DoActionStream>, Status> {
+        Err(Status::unimplemented("Implement do_action"))
+    }
+
+    async fn list_actions(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<Self::ListActionsStream>, Status> {
+        Err(Status::unimplemented("Implement list_actions"))
+    }
+
+    async fn do_exchange(
+        &self,
+        _request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        Err(Status::unimplemented("Implement do_exchange"))
+    }
+}
 
 macro_rules! impl_record_batch_to_map {
     ($func:ident, $value_type:ty, $array_type:ty) => {
@@ -154,42 +297,46 @@ mod tests {
     };
 
     use super::*;
-    use tokio::{
-        net::UdpSocket,
-        spawn,
-        sync::mpsc::{self, UnboundedSender},
-        time::sleep,
-    };
+    use tokio::{net::UdpSocket, spawn, time::sleep};
 
     struct MetricsBehaviorTest {
         client_socket: UdpSocket,
-        received_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
+        counter_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
+        gauge_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
         flush_interval: Duration,
     }
 
     impl MetricsBehaviorTest {
         async fn new(flush_interval_sec: u64) -> Self {
-            let server_addr = {
+            let (udp_server_addr, flight_server_addr) = {
                 // Create a localhost addr w/ a wildcard port ,
                 //   bind to get an available port,
                 //   then drop the bind and return the addr w/ available port
-                let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-                UdpSocket::bind(addr).await.unwrap().local_addr().unwrap()
+                let udp_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+                let flight_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+                (
+                    UdpSocket::bind(udp_addr)
+                        .await
+                        .unwrap()
+                        .local_addr()
+                        .unwrap(),
+                    UdpSocket::bind(flight_addr)
+                        .await
+                        .unwrap()
+                        .local_addr()
+                        .unwrap(),
+                )
             };
 
-            let (metrics_store_tx, metrics_store_rx): (
-                UnboundedSender<metrics_store::Message>,
-                UnboundedReceiver<metrics_store::Message>,
-            ) = mpsc::unbounded_channel();
-
             let mut udp_server = udp_server::UdpServer::new(
-                server_addr.port(),
+                udp_server_addr.port(),
+                flight_server_addr.port(),
                 flush_interval_sec,
-                metrics_store_tx,
             );
-            let mut metrics_store = TestMetricsStore::new(metrics_store_rx);
+            let mut metrics_store = TestMetricsStore::new(flight_server_addr.port());
 
-            let received_record_batches = metrics_store.record_batches.clone();
+            let counter_record_batches = metrics_store.counter_record_batches.clone();
+            let gauge_record_batches = metrics_store.gauge_record_batches.clone();
 
             // Start services and wait for them to be ready
             let running_services = start_services(
@@ -205,7 +352,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            client_socket.connect(server_addr).await.unwrap();
+            client_socket.connect(udp_server_addr).await.unwrap();
 
             // Spawn a background tasks that waits for the services
             spawn(async move {
@@ -214,7 +361,8 @@ mod tests {
 
             Self {
                 client_socket,
-                received_record_batches,
+                counter_record_batches,
+                gauge_record_batches,
                 flush_interval: Duration::from_secs(flush_interval_sec),
             }
         }
@@ -227,12 +375,17 @@ mod tests {
             sleep(self.flush_interval).await;
         }
 
-        fn get_batches(&self) -> Vec<RecordBatch> {
-            self.received_record_batches.read().unwrap().clone()
+        fn get_counter_batches(&self) -> Vec<RecordBatch> {
+            self.counter_record_batches.read().unwrap().clone()
+        }
+
+        fn get_gauge_batches(&self) -> Vec<RecordBatch> {
+            self.gauge_record_batches.read().unwrap().clone()
         }
 
         fn clear_batches(&self) {
-            self.received_record_batches.write().unwrap().clear();
+            self.counter_record_batches.write().unwrap().clear();
+            self.gauge_record_batches.write().unwrap().clear();
         }
     }
 
@@ -248,7 +401,7 @@ mod tests {
             .await;
 
         metrics_behavior_test.wait_for_flush().await;
-        let batches = metrics_behavior_test.get_batches();
+        let batches = metrics_behavior_test.get_counter_batches();
 
         let expected = BTreeMap::from_iter(vec![
             (("metric1".into(), Tags::new()), 3),
@@ -307,7 +460,7 @@ mod tests {
             .await;
 
         metrics_behavior_test.wait_for_flush().await;
-        let batches = metrics_behavior_test.get_batches();
+        let counter_batches = metrics_behavior_test.get_counter_batches();
 
         let expected_counters = BTreeMap::from_iter(vec![
             (("metric1".into(), Tags::new()), 1),
@@ -315,15 +468,24 @@ mod tests {
             (("metric3".into(), Tags::new()), 0),
             (("metric4".into(), Tags::new()), 2),
         ]);
-        assert_eq!(expected_counters, record_batch_to_hashmap_i64(&batches[0]));
+        assert_eq!(
+            expected_counters,
+            record_batch_to_hashmap_i64(&counter_batches[0])
+        );
+        assert_eq!(counter_batches.len(), 1);
 
+        let gauge_batches = metrics_behavior_test.get_gauge_batches();
         let expected_gauges = BTreeMap::from_iter(vec![
             (("metric1".into(), Tags::new()), 1.0),
             (("metric2".into(), Tags::new()), 2.0),
             (("metric3".into(), Tags::new()), 0.0),
             (("metric4".into(), Tags::new()), 2.0),
         ]);
-        assert_eq!(expected_gauges, record_batch_to_hashmap_f64(&batches[1]));
+        assert_eq!(
+            expected_gauges,
+            record_batch_to_hashmap_f64(&gauge_batches[0])
+        );
+        assert_eq!(gauge_batches.len(), 1);
     }
 
     #[tokio::test]
@@ -374,15 +536,20 @@ mod tests {
         metrics_behavior_test.wait_for_flush().await;
 
         // Check the aggregated data
-        let batches = metrics_behavior_test.get_batches();
+        let counter_batches = metrics_behavior_test.get_counter_batches();
 
         let expected_counters = BTreeMap::from_iter(vec![
             (("metric1".into(), Tags::new()), 7),
             (("metric3".into(), Tags::new()), 0),
             (("metric4".into(), Tags::new()), 7),
         ]);
-        assert_eq!(expected_counters, record_batch_to_hashmap_i64(&batches[0]));
+        assert_eq!(
+            expected_counters,
+            record_batch_to_hashmap_i64(&counter_batches[0])
+        );
+        assert_eq!(counter_batches.len(), 1);
 
+        let gauge_batches = metrics_behavior_test.get_gauge_batches();
         let expected_gauges = BTreeMap::from_iter(vec![
             (("metric1".into(), Tags::new()), 17.0),
             (("metric2".into(), Tags::new()), 3.0),
@@ -392,6 +559,10 @@ mod tests {
             (("metric6".into(), Tags::new()), -7.0),
             (("metric7".into(), Tags::new()), 7.0),
         ]);
-        assert_eq!(expected_gauges, record_batch_to_hashmap_f64(&batches[1]));
+        assert_eq!(
+            expected_gauges,
+            record_batch_to_hashmap_f64(&gauge_batches[0])
+        );
+        assert_eq!(gauge_batches.len(), 1);
     }
 }

@@ -12,6 +12,10 @@ pub struct Cli {
     /// Port to listen for metrics over UDP.
     pub udp_port: u16,
 
+    #[arg(long, default_value_t = 1213)]
+    /// Port to listen for Arrow Flight data over gRPC.
+    pub flight_port: u16,
+
     #[arg(long)]
     /// Path to store metrics data files.
     pub data_dir: PathBuf,

@@ -1,47 +1,107 @@
-use crate::metric::{Metric, MetricValue, Tags, parse_packet};
-use crate::{Service, metrics_store};
-use anyhow::{Context as _, Result};
-use arrow::array::{
-    ArrayRef, Float64Builder, Int64Builder, MapBuilder, RecordBatch, StringBuilder,
-    TimestampSecondBuilder,
+use crate::{
+    Service,
+    metric::{Metric, MetricValue, Tags, parse_packet},
 };
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::ipc::writer::StreamWriter;
+use anyhow::{Context as _, Result};
+use arrow::{
+    array::{
+        ArrayRef, Float64Builder, Int64Builder, MapBuilder, RecordBatch, StringBuilder,
+        TimestampSecondBuilder,
+    },
+    datatypes::{DataType, Field, Schema, TimeUnit},
+};
+use arrow_flight::{
+    FlightClient, FlightDescriptor, PutResult,
+    encode::{FlightDataEncoder, FlightDataEncoderBuilder},
+};
 use chrono::{DateTime, Timelike as _, Utc};
+use futures::{TryStreamExt, stream};
 use log::info;
-use std::collections::HashMap;
-use std::time::Duration;
 use std::{
+    collections::HashMap,
     future::Future,
     net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
-use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedSender, time};
+use tokio::{net::UdpSocket, select, time};
 use tokio_util::sync::CancellationToken;
+use tonic::transport::Channel;
 
 const MAX_RECEIVE_BUFFER_BYTES: usize = 10_000;
 
 pub struct UdpServer {
     is_ready: Arc<AtomicBool>,
-    port: u16,
+    udp_port: u16,
+    flight_port: u16,
     flush_interval: u64,
-    metrics_store_tx: UnboundedSender<metrics_store::Message>,
 }
 
 impl UdpServer {
-    pub fn new(
-        port: u16,
-        flush_interval: u64,
-        metrics_store_tx: UnboundedSender<metrics_store::Message>,
-    ) -> Self {
+    pub fn new(udp_port: u16, flight_port: u16, flush_interval: u64) -> Self {
         Self {
             is_ready: Arc::new(AtomicBool::new(false)),
-            port,
+            udp_port,
+            flight_port,
             flush_interval,
-            metrics_store_tx,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MetricData<'m> {
+    Counters(&'m HashMap<(String, Tags), i64>),
+    Gauges(&'m HashMap<(String, Tags), f64>),
+}
+
+impl<'m> MetricData<'m> {
+    fn len(&self) -> usize {
+        match self {
+            MetricData::Counters(data) => data.len(),
+            MetricData::Gauges(data) => data.len(),
+        }
+    }
+
+    fn metric_type_name(&self) -> &'static str {
+        match self {
+            MetricData::Counters(_) => "counters",
+            MetricData::Gauges(_) => "gauges",
+        }
+    }
+
+    fn data_type(&self) -> DataType {
+        match self {
+            MetricData::Counters(_) => DataType::Int64,
+            MetricData::Gauges(_) => DataType::Float64,
+        }
+    }
+
+    fn build_values_array(&self) -> Result<ArrayRef> {
+        match self {
+            MetricData::Counters(data) => {
+                let mut builder = Int64Builder::new();
+                for (_, value) in data.iter() {
+                    builder.append_value(*value);
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            MetricData::Gauges(data) => {
+                let mut builder = Float64Builder::new();
+                for (_, value) in data.iter() {
+                    builder.append_value(*value);
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+        }
+    }
+
+    fn iter_keys(&self) -> Box<dyn Iterator<Item = &(String, Tags)> + '_> {
+        match self {
+            MetricData::Counters(data) => Box::new(data.keys()),
+            MetricData::Gauges(data) => Box::new(data.keys()),
         }
     }
 }
@@ -110,7 +170,11 @@ impl FlushIntervalAggregates {
         }
     }
 
-    fn serialize_counters(&self, flushed_at: DateTime<Utc>) -> Result<Vec<u8>> {
+    fn serialize_metrics(
+        &self,
+        metric_data: MetricData,
+        flushed_at: DateTime<Utc>,
+    ) -> Result<FlightDataEncoder> {
         let names_schema = Field::new("name", DataType::Utf8, false);
         let tags_schema = Field::new_map(
             "tags",
@@ -127,15 +191,13 @@ impl FlushIntervalAggregates {
         );
 
         let mut names_builder = StringBuilder::new();
-        let mut values_builder = Int64Builder::new();
         let mut tags_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         let mut flushed_at_builder =
             TimestampSecondBuilder::new().with_data_type(flushed_at_schema.data_type().clone());
 
-        flushed_at_builder.append_value_n(flushed_at.timestamp(), self.counters.len());
-        for ((name, tags), value) in &self.counters {
+        flushed_at_builder.append_value_n(flushed_at.timestamp(), metric_data.len());
+        for (name, tags) in metric_data.iter_keys() {
             names_builder.append_value(name);
-            values_builder.append_value(*value);
 
             let (kb, vb) = tags_builder.entries();
             for (tag_key, tag_value) in tags {
@@ -145,100 +207,49 @@ impl FlushIntervalAggregates {
             tags_builder.append(true)?;
         }
 
+        let values_array = metric_data.build_values_array()?;
+
         let schema = Schema::new(vec![
             names_schema.clone(),
-            Field::new("value", DataType::Int64, false),
+            Field::new("value", metric_data.data_type(), false),
             tags_schema.clone(),
             flushed_at_schema.clone(),
         ]);
         let data: Vec<ArrayRef> = vec![
             Arc::new(names_builder.finish()),
-            Arc::new(values_builder.finish()),
+            values_array,
             Arc::new(tags_builder.finish()),
             Arc::new(flushed_at_builder.finish()),
         ];
+
         let batch = RecordBatch::try_new(schema.into(), data)?;
 
-        let mut buffer = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())?;
-            writer.write(&batch)?;
-            writer.finish()?;
-        }
-        Ok(buffer)
+        Ok(FlightDataEncoderBuilder::new()
+            .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![
+                flushed_at.to_rfc3339(),
+                metric_data.metric_type_name().to_string(),
+            ])))
+            .build(stream::iter([Ok(batch)])))
     }
 
-    fn serialize_gauges(&self, flushed_at: DateTime<Utc>) -> Result<Vec<u8>> {
-        let names_schema = Field::new("name", DataType::Utf8, false);
-        let tags_schema = Field::new_map(
-            "tags",
-            "entries",
-            Field::new("keys", DataType::Utf8, false),
-            Field::new("values", DataType::Utf8, true),
-            false,
-            false,
-        );
-        let flushed_at_schema = Field::new(
-            "flushed_at",
-            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())), // UTC timezone offset
-            false,
-        );
-
-        let mut names_builder = StringBuilder::new();
-        let mut values_builder = Float64Builder::new();
-        let mut tags_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-        let mut flushed_at_builder =
-            TimestampSecondBuilder::new().with_data_type(flushed_at_schema.data_type().clone());
-
-        flushed_at_builder.append_value_n(flushed_at.timestamp(), self.gauges.len());
-        for ((name, tags), value) in &self.gauges {
-            names_builder.append_value(name);
-            values_builder.append_value(*value);
-
-            let (kb, vb) = tags_builder.entries();
-            for (tag_key, tag_value) in tags {
-                kb.append_value(tag_key);
-                vb.append_option(tag_value.clone());
-            }
-            tags_builder.append(true)?;
-        }
-
-        let schema = Schema::new(vec![
-            names_schema.clone(),
-            Field::new("value", DataType::Float64, false),
-            tags_schema.clone(),
-            flushed_at_schema.clone(),
-        ]);
-        let data: Vec<ArrayRef> = vec![
-            Arc::new(names_builder.finish()),
-            Arc::new(values_builder.finish()),
-            Arc::new(tags_builder.finish()),
-            Arc::new(flushed_at_builder.finish()),
-        ];
-        let batch = RecordBatch::try_new(schema.into(), data)?;
-
-        let mut buffer = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())?;
-            writer.write(&batch)?;
-            writer.finish()?;
-        }
-        Ok(buffer)
+    fn serialize_counters(&self, flushed_at: DateTime<Utc>) -> Result<FlightDataEncoder> {
+        self.serialize_metrics(MetricData::Counters(&self.counters), flushed_at)
     }
 
-    /// Exports metrics as Messages containing serialized RecordBatches and
-    ///   sets up for the next Flush Interval
-    /// Messages are expoerted in multiple batches...
-    ///   - ... 1 batch per type
-    ///   - ... batch order is consistent across flush intervals
-    pub fn flush(&mut self, flushed_at: DateTime<Utc>) -> Result<Vec<metrics_store::Message>> {
-        let messages = vec![
-            metrics_store::Message::Counters(self.serialize_counters(flushed_at)?),
-            metrics_store::Message::Gauges(self.serialize_gauges(flushed_at)?),
-        ];
+    fn serialize_gauges(&self, flushed_at: DateTime<Utc>) -> Result<FlightDataEncoder> {
+        self.serialize_metrics(MetricData::Gauges(&self.gauges), flushed_at)
+    }
+
+    /// Exports metrics as FlightData and sets up for the next Flush Interval
+    pub fn flush(&mut self, flushed_at: DateTime<Utc>) -> Result<Vec<FlightDataEncoder>> {
+        // Encode metrics as a stream of FlightData
+        let counters_flight_stream = self.serialize_counters(flushed_at)?;
+        let gauges_flight_stream = self.serialize_gauges(flushed_at)?;
+
         // Delete counters after each flush interval
         self.counters = HashMap::new();
-        Ok(messages)
+
+        Ok(vec![counters_flight_stream, gauges_flight_stream])
     }
 }
 
@@ -247,23 +258,30 @@ impl Service for UdpServer {
         &mut self,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
-        let port = self.port;
+        let udp_port = self.udp_port;
+        let flight_port = self.flight_port;
         let is_ready = Arc::clone(&self.is_ready);
         let mut flush_interval = time::interval(Duration::from_secs(self.flush_interval));
         let mut aggregates = FlushIntervalAggregates::new();
-        let metrics_store_tx = self.metrics_store_tx.clone();
 
         async move {
-            flush_interval.tick().await; // The first tick is immediate, so skip
+            let addr = format!("http://localhost:{flight_port}");
+            let channel = Channel::from_shared(addr)
+                .expect("invalid address for flight server")
+                .connect()
+                .await
+                .expect("error connecting to flight server");
+            let mut flight_client = FlightClient::new(channel);
 
-            // FIXME allow non-localhost IPs
-            let socket_addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let socket_addr = SocketAddr::from(([127, 0, 0, 1], udp_port));
             let socket = UdpSocket::bind(socket_addr).await?;
             info!(
                 "UDP server listening on {}:{}",
                 socket_addr.ip(),
                 socket_addr.port()
             );
+
+            flush_interval.tick().await; // The first tick is immediate, so skip
 
             let mut buf = [0; MAX_RECEIVE_BUFFER_BYTES];
             is_ready.store(true, Ordering::SeqCst);
@@ -289,12 +307,15 @@ impl Service for UdpServer {
                         let flushed_at = Utc::now().with_nanosecond(0).context("Failed to truncate flush datetime to seconds-level precision")?;
                         info!("Flush @ {flushed_at}");
 
-                        let outgoing_messages = aggregates.flush(flushed_at)?;
-
-                        for message in outgoing_messages {
-                            metrics_store_tx.send(message)?;
+                        // Send Flights to server
+                        let outgoing_flights = aggregates.flush(flushed_at)?;
+                        for flight in outgoing_flights {
+                            let _response: Vec<PutResult> = flight_client
+                                .do_put(flight)
+                                .await?
+                                .try_collect()
+                                .await?;
                         }
-
                     }
                 }
             }
