@@ -3,6 +3,7 @@ use std::future::Future;
 use tokio_util::sync::CancellationToken;
 
 pub mod cli;
+pub mod http_server;
 pub mod metric;
 pub mod metrics_store;
 pub mod redb_table_provider;

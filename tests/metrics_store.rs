@@ -11,6 +11,7 @@ use datafusion::arrow::{
 use futures::{Future, TryStreamExt, stream};
 use statsdfusion::{
     Service,
+    http_server::HttpServerService,
     metric::schema_fields::{counters_schema, gauges_schema},
     metrics_store::MetricsStore,
     startup::{RunningServices, StartupConfig, start_services},
@@ -150,6 +151,30 @@ impl Service for TestUdpServer {
 
 impl UdpServerService for TestUdpServer {}
 
+struct TestHttpServer {}
+
+impl TestHttpServer {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Service for TestHttpServer {
+    #[allow(clippy::manual_async_fn)]
+    fn service(
+        &mut self,
+        _cancellation_token: CancellationToken,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
+        async move { Ok(()) }
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+impl HttpServerService for TestHttpServer {}
+
 fn create_counter_batch(flushed_at: DateTime<Utc>) -> Result<RecordBatch> {
     let schema = counters_schema();
 
@@ -209,10 +234,12 @@ async fn start_metrics_store_with_client(
 
     let mut metrics_store = MetricsStore::new(temp_dir.path().to_path_buf(), port);
     let mut test_udp_server = TestUdpServer::new(port);
+    let mut test_http_server = TestHttpServer::new();
 
     let running_services = start_services(
         &mut metrics_store,
         &mut test_udp_server,
+        &mut test_http_server,
         StartupConfig::default(),
     )
     .await?;

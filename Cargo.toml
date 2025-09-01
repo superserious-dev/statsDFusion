@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.98"
 arrow-flight = "55.2.0"
 async-trait = "0.1.89"
+axum = "0.8.4"
 chrono = "0.4.41"
 chumsky = "0.10.1"
 clap = { version = "4.5.43", features = ["derive"] }

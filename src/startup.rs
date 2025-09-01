@@ -1,4 +1,7 @@
-use crate::{metrics_store::MetricsStoreService, udp_server::UdpServerService};
+use crate::{
+    http_server::HttpServerService, metrics_store::MetricsStoreService,
+    udp_server::UdpServerService,
+};
 use anyhow::{Result, bail};
 use futures::{FutureExt, future::select_all};
 use log::info;
@@ -84,14 +87,16 @@ impl RunningServices {
 /// Starts the required services and waits for them to be ready.
 /// The metrics store should be started before everything else because
 ///   it's required for reading and writing metrics.
-pub async fn start_services<M, U>(
+pub async fn start_services<M, U, H>(
     metrics_store: &mut M,
     udp_server: &mut U,
+    http_server: &mut H,
     config: StartupConfig,
 ) -> Result<RunningServices>
 where
     M: MetricsStoreService,
     U: UdpServerService,
+    H: HttpServerService,
 {
     let cancellation_token = CancellationToken::new();
     let tracker = TaskTracker::new();
@@ -122,10 +127,23 @@ where
         retry_counter += 1;
     }
 
+    info!("UDP server is ready, starting Http server...");
+    let http_server_task = tracker.spawn(http_server.service(cancellation_token.clone()));
+
+    let mut retry_counter: u8 = 0;
+    while !http_server.is_ready() {
+        if retry_counter >= config.max_retries {
+            cancellation_token.cancel();
+            bail!("Failed to start Http server.");
+        }
+        sleep(config.retry_delay).await;
+        retry_counter += 1;
+    }
+
     info!("All services are ready!");
     Ok(RunningServices {
         cancellation_token,
         tracker,
-        tasks: vec![metrics_store_task, udp_server_task],
+        tasks: vec![metrics_store_task, udp_server_task, http_server_task],
     })
 }

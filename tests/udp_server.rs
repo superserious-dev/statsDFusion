@@ -13,6 +13,7 @@ use futures::stream::{self, BoxStream};
 use futures::{StreamExt as _, TryStreamExt as _};
 use statsdfusion::{
     Service,
+    http_server::HttpServerService,
     metric::Tags,
     metrics_store::MetricsStoreService,
     startup::{StartupConfig, start_services},
@@ -226,6 +227,33 @@ impl FlightService for InnerFlightServer {
     }
 }
 
+struct TestHttpServer {}
+
+impl TestHttpServer {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Service for TestHttpServer {
+    #[allow(clippy::manual_async_fn)]
+    fn service(
+        &mut self,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
+        async move {
+            cancellation_token.cancelled().await;
+            Ok(())
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+impl HttpServerService for TestHttpServer {}
+
 macro_rules! impl_record_batch_to_map {
     ($func:ident, $value_type:ty, $array_type:ty) => {
         fn $func(batch: &RecordBatch) -> BTreeMap<(String, Tags), $value_type> {
@@ -336,6 +364,7 @@ mod tests {
                 flush_interval_sec,
             );
             let mut metrics_store = TestMetricsStore::new(flight_server_addr.port());
+            let mut http_server = TestHttpServer::new();
 
             let counter_record_batches = metrics_store.counter_record_batches.clone();
             let gauge_record_batches = metrics_store.gauge_record_batches.clone();
@@ -344,6 +373,7 @@ mod tests {
             let running_services = start_services(
                 &mut metrics_store,
                 &mut udp_server,
+                &mut http_server,
                 StartupConfig::default(),
             )
             .await

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser as _;
 use log::info;
 use statsdfusion::{
-    cli, metrics_store,
+    cli, http_server, metrics_store,
     startup::{StartupConfig, start_services},
     udp_server,
 };
@@ -20,9 +20,11 @@ async fn main() -> Result<()> {
     let mut udp_server =
         udp_server::UdpServer::new(args.udp_port, args.flight_port, args.flush_interval);
     let mut metrics_store = metrics_store::MetricsStore::new(args.data_dir, args.flight_port);
+    let mut http_server = http_server::HttpServer::new(args.http_port);
     let running_services = start_services(
         &mut metrics_store,
         &mut udp_server,
+        &mut http_server,
         StartupConfig::default(),
     )
     .await?;
