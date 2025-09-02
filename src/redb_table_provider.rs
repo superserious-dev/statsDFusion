@@ -36,10 +36,21 @@ impl RedbTable {
         name: &'static str,
         record_batch_schema: SchemaRef,
     ) -> anyhow::Result<Self> {
+        let table_definition = TableDefinition::new(name);
+
+        // Write no-op to ensure table is created
+        if let Ok(db) = db.lock() {
+            let write_txn = db.begin_write()?;
+            {
+                write_txn.open_table(table_definition)?;
+            }
+            write_txn.commit()?;
+        }
+
         Ok(Self {
             db,
             name: name.to_string(),
-            table_definition: TableDefinition::new(name),
+            table_definition,
             record_batch_schema,
         })
     }
