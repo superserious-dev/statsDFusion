@@ -8,6 +8,7 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     decode::FlightRecordBatchStream,
+    encode::FlightDataEncoderBuilder,
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService, FlightServiceServer},
 };
@@ -16,6 +17,7 @@ use datafusion::{
     arrow::{array::RecordBatch, ipc::writer::StreamWriter},
     datasource::TableProvider,
     prelude::SessionContext,
+    scalar::ScalarValue,
 };
 use futures::{
     StreamExt as _, TryStreamExt as _,
@@ -23,6 +25,7 @@ use futures::{
 };
 use log::info;
 use redb::{Database, TableDefinition};
+use serde::{Deserialize, Serialize};
 use std::{
     io::Cursor,
     net::SocketAddr,
@@ -42,9 +45,15 @@ pub const HOT_METRICS_TABLE_GAUGES: &str = "gauges";
 
 const HOT_METRICS_TABLES: [&str; 2] = [HOT_METRICS_TABLE_COUNTERS, HOT_METRICS_TABLE_GAUGES];
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
+pub enum DoGetQuery {
+    NameRegexWithFlushedAtInterval(String, (DateTime<Utc>, DateTime<Utc>)),
+}
+
+#[derive(Clone)]
 struct InnerFlightServer {
     database: Arc<Mutex<Database>>,
+    ctx: SessionContext,
 }
 
 impl InnerFlightServer {
@@ -61,7 +70,7 @@ impl InnerFlightServer {
 
     fn write_batch(
         &self,
-        table_defintiton: TableDefinition<i64, Vec<u8>>,
+        table_definition: TableDefinition<i64, Vec<u8>>,
         flushed_at: DateTime<Utc>,
         batch: &RecordBatch,
     ) -> Result<()> {
@@ -70,7 +79,7 @@ impl InnerFlightServer {
         if let Ok(db) = self.database.lock() {
             let write_txn = db.begin_write()?;
             {
-                let mut table = write_txn.open_table(table_defintiton)?;
+                let mut table = write_txn.open_table(table_definition)?;
                 table.insert(flushed_at.timestamp(), bytes)?;
             }
             write_txn.commit()?;
@@ -138,9 +147,76 @@ impl FlightService for InnerFlightServer {
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Err(Status::unimplemented("Implement do_get"))
+        let bytes = &request.get_ref().ticket;
+        let query: DoGetQuery = serde_json::from_slice(bytes).unwrap();
+        dbg!(&query);
+
+        let flight_stream = match query {
+            DoGetQuery::NameRegexWithFlushedAtInterval(
+                mut name_regex,
+                (flushed_at_start, flushed_at_end),
+            ) => {
+                // Anchor regex if it's not anchored
+                if !name_regex.starts_with("^") {
+                    name_regex.insert(0, '^');
+                }
+                if !name_regex.ends_with("$") {
+                    name_regex.push('$');
+                }
+
+                let df = self
+                    .ctx
+                    .sql(&format!(
+                        "
+                        SELECT * FROM (
+                            SELECT flushed_at, name, tags, value FROM {HOT_METRICS_TABLE_COUNTERS}
+                            UNION ALL
+                            SELECT flushed_at, name, tags, value FROM {HOT_METRICS_TABLE_GAUGES}
+                        )
+                        WHERE flushed_at >= $flushed_at_start
+                            AND flushed_at <= $flushed_at_end
+                            AND name ~ $name_regex
+                        ORDER BY flushed_at ASC
+                        "
+                    ))
+                    .await
+                    .map_err(|e| Status::unknown(e.to_string()))?
+                    .with_param_values(vec![
+                        (
+                            "flushed_at_start",
+                            ScalarValue::TimestampSecond(
+                                Some(flushed_at_start.timestamp()),
+                                Some("+00:00".into()),
+                            ),
+                        ),
+                        (
+                            "flushed_at_end",
+                            ScalarValue::TimestampSecond(
+                                Some(flushed_at_end.timestamp()),
+                                Some("+00:00".into()),
+                            ),
+                        ),
+                        ("name_regex", ScalarValue::from(name_regex)),
+                    ])
+                    .map_err(|e| Status::unknown(e.to_string()))?;
+
+                let record_batch_stream = df
+                    .execute_stream()
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map(|s| {
+                        s.map_err(|e| arrow_flight::error::FlightError::ExternalError(e.into()))
+                    });
+                FlightDataEncoderBuilder::new()
+                    .build(record_batch_stream)
+                    .map_err(|e| Status::internal(e.to_string()))
+            }
+        };
+
+        let response = Response::new(Box::pin(flight_stream) as Self::DoGetStream);
+        Ok(response)
     }
 
     async fn do_put(
@@ -279,33 +355,33 @@ impl Service for MetricsStore {
 
         async move {
             let hot_metrics_path = &data_dir.join(HOT_METRICS_DB);
-            let db = Arc::new(Mutex::new(Database::create(hot_metrics_path)?));
+            let database = Arc::new(Mutex::new(Database::create(hot_metrics_path)?));
             let ctx = SessionContext::new();
 
             let counters_schema = counters_schema();
             let gauges_schema = gauges_schema();
 
             let redb_counters_table = Arc::new(RedbTable::new(
-                db.clone(),
+                database.clone(),
                 HOT_METRICS_TABLE_COUNTERS,
                 counters_schema,
             )?);
             let _ = ctx.register_table(
-                "counters",
+                HOT_METRICS_TABLE_COUNTERS,
                 Arc::clone(&redb_counters_table) as Arc<dyn TableProvider>,
             );
             let redb_gauges_table = Arc::new(RedbTable::new(
-                db.clone(),
+                database.clone(),
                 HOT_METRICS_TABLE_GAUGES,
                 gauges_schema,
             )?);
             let _ = ctx.register_table(
-                "gauges",
+                HOT_METRICS_TABLE_GAUGES,
                 Arc::clone(&redb_gauges_table) as Arc<dyn TableProvider>,
             );
 
             let socket_addr = SocketAddr::from(([127, 0, 0, 1], flight_port));
-            let service = InnerFlightServer { database: db };
+            let service = InnerFlightServer { database, ctx };
             let svc = FlightServiceServer::new(service);
 
             info!("Starting Flight server @ {socket_addr}");

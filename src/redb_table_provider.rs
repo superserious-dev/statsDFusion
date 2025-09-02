@@ -80,7 +80,7 @@ impl TableProvider for RedbTable {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        _filters: &[Expr], // FIXME support filter pushdown for WHERE clauses
         _limit: Option<usize>,
     ) -> datafusion::common::error::Result<Arc<dyn ExecutionPlan>> {
         let scan = RedbTableScanExec::new(Arc::new(self.clone()), projection);
