@@ -176,14 +176,14 @@ impl FlushIntervalAggregates {
         metric_data: MetricData,
         flushed_at: DateTime<Utc>,
     ) -> Result<FlightDataEncoder> {
-        let names_schema = schema_fields::name_field();
-        let tags_schema = schema_fields::tags_field();
-        let flushed_at_schema = schema_fields::flushed_at_field();
+        let names_field = schema_fields::name_field();
+        let tags_field = schema_fields::tags_field();
+        let flushed_at_field = schema_fields::flushed_at_field();
 
         let mut names_builder = StringBuilder::new();
         let mut tags_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         let mut flushed_at_builder =
-            TimestampSecondBuilder::new().with_data_type(flushed_at_schema.data_type().clone());
+            TimestampSecondBuilder::new().with_data_type(flushed_at_field.data_type().clone());
 
         flushed_at_builder.append_value_n(flushed_at.timestamp(), metric_data.len());
         for (name, tags) in metric_data.iter_keys() {
@@ -200,10 +200,10 @@ impl FlushIntervalAggregates {
         let values_array = metric_data.build_values_array()?;
 
         let schema = Schema::new(vec![
-            names_schema.clone(),
+            names_field.clone(),
             Field::new("value", metric_data.data_type(), false),
-            tags_schema.clone(),
-            flushed_at_schema.clone(),
+            tags_field.clone(),
+            flushed_at_field.clone(),
         ]);
         let data: Vec<ArrayRef> = vec![
             Arc::new(names_builder.finish()),
