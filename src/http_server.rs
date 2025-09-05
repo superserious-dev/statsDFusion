@@ -116,7 +116,7 @@ mod routes {
 
     #[derive(Debug, Serialize)]
     pub(crate) struct HistoryResponse {
-        metrics: Value,
+        flushes: Value,
     }
 
     #[derive(Debug, Deserialize)]
@@ -206,8 +206,8 @@ mod routes {
         match state.flight_client.lock().await.do_get(ticket).await {
             Ok(record_batch_stream) => match record_batch_stream.try_collect::<Vec<_>>().await {
                 Ok(batches) => match recordbatches_to_json(&batches) {
-                    Ok(metrics) => {
-                        let response = HistoryResponse { metrics };
+                    Ok(flushes) => {
+                        let response = HistoryResponse { flushes };
                         Json(response).into_response()
                     }
                     Err(e) => {

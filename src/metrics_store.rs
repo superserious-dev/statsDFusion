@@ -1,6 +1,6 @@
 use crate::{
     Service,
-    metric::schema_fields::{counters_schema, gauges_schema},
+    metric::schema_fields::{counters_schema, gauges_schema, heartbeat_schema},
     redb_table_provider::RedbTable,
 };
 use anyhow::{Result, anyhow};
@@ -40,10 +40,15 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming, transport::Server};
 
 const HOT_METRICS_DB: &str = "hot_metrics.redb";
+pub const HOT_METRICS_TABLE_HEARTBEAT: &str = "heartbeat";
 pub const HOT_METRICS_TABLE_COUNTERS: &str = "counters";
 pub const HOT_METRICS_TABLE_GAUGES: &str = "gauges";
 
-const HOT_METRICS_TABLES: [&str; 2] = [HOT_METRICS_TABLE_COUNTERS, HOT_METRICS_TABLE_GAUGES];
+const HOT_METRICS_TABLES: [&str; 3] = [
+    HOT_METRICS_TABLE_HEARTBEAT,
+    HOT_METRICS_TABLE_COUNTERS,
+    HOT_METRICS_TABLE_GAUGES,
+];
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum DoGetQuery {
@@ -85,6 +90,12 @@ impl InnerFlightServer {
             write_txn.commit()?;
         }
         Ok(())
+    }
+
+    fn write_heartbeat(&self, flushed_at: DateTime<Utc>, batch: &RecordBatch) -> Result<()> {
+        const HEARTBEAT_TABLE: TableDefinition<i64, Vec<u8>> =
+            TableDefinition::new(HOT_METRICS_TABLE_HEARTBEAT);
+        self.write_batch(HEARTBEAT_TABLE, flushed_at, batch)
     }
 
     fn write_counters_batch(&self, flushed_at: DateTime<Utc>, batch: &RecordBatch) -> Result<()> {
@@ -151,7 +162,6 @@ impl FlightService for InnerFlightServer {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let bytes = &request.get_ref().ticket;
         let query: DoGetQuery = serde_json::from_slice(bytes).unwrap();
-        dbg!(&query);
 
         let flight_stream = match query {
             DoGetQuery::NameRegexWithFlushedAtInterval(
@@ -170,15 +180,42 @@ impl FlightService for InnerFlightServer {
                     .ctx
                     .sql(&format!(
                         "
-                        SELECT * FROM (
-                            SELECT flushed_at, name, tags, value FROM {HOT_METRICS_TABLE_COUNTERS}
-                            UNION ALL
-                            SELECT flushed_at, name, tags, value FROM {HOT_METRICS_TABLE_GAUGES}
+                        WITH heartbeat AS (
+                            SELECT flushed_at
+                            FROM {HOT_METRICS_TABLE_HEARTBEAT}
+                            WHERE
+                                flushed_at >= $flushed_at_start
+                                AND flushed_at <= $flushed_at_end
+                        ),
+                        raw_metrics AS (
+                            SELECT *
+                            FROM (
+                                SELECT flushed_at, name, tags, value
+                                FROM {HOT_METRICS_TABLE_COUNTERS}
+
+                                UNION ALL
+
+                                SELECT flushed_at, name, tags, value
+                                FROM {HOT_METRICS_TABLE_GAUGES}
+                            )
+                        ),
+                        matched_metrics AS (
+                            SELECT flushed_at, NAMED_STRUCT('name', name, 'tags', tags, 'value', value) as data
+                            FROM raw_metrics
+                            WHERE name ~ $name_regex
                         )
-                        WHERE flushed_at >= $flushed_at_start
-                            AND flushed_at <= $flushed_at_end
-                            AND name ~ $name_regex
-                        ORDER BY flushed_at ASC
+                        SELECT
+                            heartbeat.flushed_at, array_agg(matched_metrics.data) AS metrics
+                        FROM
+                            heartbeat
+                        LEFT JOIN
+                            matched_metrics
+                        ON
+                            heartbeat.flushed_at = matched_metrics.flushed_at
+                        GROUP BY
+                            heartbeat.flushed_at
+                        ORDER BY
+                            heartbeat.flushed_at ASC
                         "
                     ))
                     .await
@@ -281,6 +318,10 @@ impl FlightService for InnerFlightServer {
         while let Some(batch) = record_batch_stream.next().await {
             match batch {
                 Ok(batch) => match table.as_str() {
+                    HOT_METRICS_TABLE_HEARTBEAT => {
+                        self.write_heartbeat(flushed_at, &batch)
+                            .map_err(|e| Status::unknown(e.to_string()))?;
+                    }
                     HOT_METRICS_TABLE_COUNTERS => {
                         self.write_counters_batch(flushed_at, &batch)
                             .map_err(|e| Status::unknown(e.to_string()))?;
@@ -358,9 +399,19 @@ impl Service for MetricsStore {
             let database = Arc::new(Mutex::new(Database::create(hot_metrics_path)?));
             let ctx = SessionContext::new();
 
+            let heartbeat_schema = heartbeat_schema();
             let counters_schema = counters_schema();
             let gauges_schema = gauges_schema();
 
+            let redb_heartbeat_table = Arc::new(RedbTable::new(
+                database.clone(),
+                HOT_METRICS_TABLE_HEARTBEAT,
+                heartbeat_schema,
+            )?);
+            let _ = ctx.register_table(
+                HOT_METRICS_TABLE_HEARTBEAT,
+                Arc::clone(&redb_heartbeat_table) as Arc<dyn TableProvider>,
+            );
             let redb_counters_table = Arc::new(RedbTable::new(
                 database.clone(),
                 HOT_METRICS_TABLE_COUNTERS,

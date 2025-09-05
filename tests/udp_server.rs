@@ -15,7 +15,10 @@ use statsdfusion::{
     Service,
     http_server::HttpServerService,
     metric::Tags,
-    metrics_store::MetricsStoreService,
+    metrics_store::{
+        HOT_METRICS_TABLE_COUNTERS, HOT_METRICS_TABLE_GAUGES, HOT_METRICS_TABLE_HEARTBEAT,
+        MetricsStoreService,
+    },
     startup::{StartupConfig, start_services},
     udp_server,
 };
@@ -35,6 +38,7 @@ use tonic::{Request, Response, Status, Streaming, transport::Server};
 struct TestMetricsStore {
     is_ready: Arc<AtomicBool>,
     flight_port: u16,
+    heartbeat_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
     counter_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
     gauge_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
 }
@@ -44,6 +48,7 @@ impl TestMetricsStore {
         Self {
             is_ready: Arc::new(AtomicBool::new(false)),
             flight_port,
+            heartbeat_record_batches: Arc::new(RwLock::new(vec![])),
             counter_record_batches: Arc::new(RwLock::new(vec![])),
             gauge_record_batches: Arc::new(RwLock::new(vec![])),
         }
@@ -56,6 +61,7 @@ impl Service for TestMetricsStore {
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let is_ready = Arc::clone(&self.is_ready);
+        let heartbeat_record_batches = Arc::clone(&self.heartbeat_record_batches);
         let counter_record_batches = Arc::clone(&self.counter_record_batches);
         let gauge_record_batches = Arc::clone(&self.gauge_record_batches);
         let flight_port = self.flight_port;
@@ -63,6 +69,7 @@ impl Service for TestMetricsStore {
         async move {
             let socket_addr = SocketAddr::from(([127, 0, 0, 1], flight_port));
             let service = InnerFlightServer {
+                heartbeat_record_batches: Arc::clone(&heartbeat_record_batches),
                 counter_record_batches: Arc::clone(&counter_record_batches),
                 gauge_record_batches: Arc::clone(&gauge_record_batches),
             };
@@ -89,6 +96,7 @@ impl MetricsStoreService for TestMetricsStore {}
 
 #[derive(Clone, Debug)]
 struct InnerFlightServer {
+    heartbeat_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
     counter_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
     gauge_record_batches: Arc<RwLock<Vec<RecordBatch>>>,
 }
@@ -191,8 +199,15 @@ impl FlightService for InnerFlightServer {
         while let Some(batch) = record_batch_stream.next().await {
             if let Ok(batch) = batch {
                 match table.as_str() {
-                    "counters" => self.counter_record_batches.write().unwrap().push(batch),
-                    "gauges" => self.gauge_record_batches.write().unwrap().push(batch),
+                    HOT_METRICS_TABLE_HEARTBEAT => {
+                        self.heartbeat_record_batches.write().unwrap().push(batch)
+                    }
+                    HOT_METRICS_TABLE_COUNTERS => {
+                        self.counter_record_batches.write().unwrap().push(batch)
+                    }
+                    HOT_METRICS_TABLE_GAUGES => {
+                        self.gauge_record_batches.write().unwrap().push(batch)
+                    }
                     _ => unimplemented!(),
                 }
             }

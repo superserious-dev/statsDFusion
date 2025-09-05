@@ -207,6 +207,10 @@ pub mod schema_fields {
         Field::new("value", DataType::Float64, false)
     }
 
+    pub fn heartbeat_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![flushed_at_field()]))
+    }
+
     pub fn counters_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             name_field(),

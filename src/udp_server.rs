@@ -1,7 +1,9 @@
 use crate::{
     Service,
     metric::{Metric, MetricValue, Tags, parse_packet, schema_fields},
-    metrics_store::{HOT_METRICS_TABLE_COUNTERS, HOT_METRICS_TABLE_GAUGES},
+    metrics_store::{
+        HOT_METRICS_TABLE_COUNTERS, HOT_METRICS_TABLE_GAUGES, HOT_METRICS_TABLE_HEARTBEAT,
+    },
 };
 use anyhow::{Context as _, Result};
 use arrow_flight::{
@@ -14,7 +16,7 @@ use datafusion::arrow::{
         ArrayRef, Float64Builder, Int64Builder, MapBuilder, RecordBatch, StringBuilder,
         TimestampSecondBuilder,
     },
-    datatypes::{DataType, Field, Schema},
+    datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use futures::{TryStreamExt, stream};
 use log::info;
@@ -230,8 +232,36 @@ impl FlushIntervalAggregates {
         self.serialize_metrics(MetricData::Gauges(&self.gauges), flushed_at)
     }
 
+    fn serialize_heartbeat(&self, flushed_at: DateTime<Utc>) -> Result<FlightDataEncoder> {
+        let field = Field::new(
+            "flushed_at",
+            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+            false,
+        );
+
+        let mut flushed_at_builder =
+            TimestampSecondBuilder::new().with_data_type(field.data_type().clone());
+        let schema = Schema::new(vec![field.clone()]);
+
+        flushed_at_builder.append_value(flushed_at.timestamp());
+
+        let data: Vec<ArrayRef> = vec![Arc::new(flushed_at_builder.finish())];
+
+        let batch = RecordBatch::try_new(schema.into(), data)?;
+
+        Ok(FlightDataEncoderBuilder::new()
+            .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![
+                flushed_at.to_rfc3339(),
+                HOT_METRICS_TABLE_HEARTBEAT.to_string(),
+            ])))
+            .build(stream::iter([Ok(batch)])))
+    }
+
     /// Exports metrics as FlightData and sets up for the next Flush Interval
     pub fn flush(&mut self, flushed_at: DateTime<Utc>) -> Result<Vec<FlightDataEncoder>> {
+        // Encode heartbeat as a stream of FlightData
+        let heartbeat_flight_stream = self.serialize_heartbeat(flushed_at)?;
+
         // Encode metrics as a stream of FlightData
         let counters_flight_stream = self.serialize_counters(flushed_at)?;
         let gauges_flight_stream = self.serialize_gauges(flushed_at)?;
@@ -239,7 +269,11 @@ impl FlushIntervalAggregates {
         // Delete counters after each flush interval
         self.counters = HashMap::new();
 
-        Ok(vec![counters_flight_stream, gauges_flight_stream])
+        Ok(vec![
+            heartbeat_flight_stream,
+            counters_flight_stream,
+            gauges_flight_stream,
+        ])
     }
 }
 

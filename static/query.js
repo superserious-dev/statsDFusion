@@ -10,15 +10,16 @@ metricsQueryForm.addEventListener("submit", function (e) {
   const formData = new FormData(metricsQueryForm);
   const params = new URLSearchParams(formData);
 
+  query(params);
+});
+
+async function query(params) {
   const flushedAtStart = new Date(params.get("flushed-at-start"));
   const flushedAtEnd = new Date(params.get("flushed-at-end"));
+
   params.set("flushed-at-start", flushedAtStart.toISOString());
   params.set("flushed-at-end", flushedAtEnd.toISOString());
 
-  query(params, flushedAtStart, flushedAtEnd);
-});
-
-async function query(params, flushedAtStart, flushedAtEnd) {
   try {
     const response = await fetch(`/query?${params.toString()}`, {
       method: "GET",
@@ -29,9 +30,10 @@ async function query(params, flushedAtStart, flushedAtEnd) {
     });
 
     if (response.ok) {
+      // NOTE incoming data is sorted flushed at ASC
       const result = await response.json();
       console.log("Success:", result); // FIXME add visual feedback while chart loading
-      buildChart(result.metrics, flushedAtStart, flushedAtEnd);
+      buildChart(result.flushes, flushedAtStart, flushedAtEnd);
     } else {
       throw new Error(`HTTP Error... status: ${response.status}`);
     }
@@ -56,31 +58,55 @@ function buildMetricIdentifier(metric) {
   return `${name} [ ${tagStrings.join(", ")} ]`;
 }
 
-function groupMetricsByIdentifier(metrics) {
-  return metrics.reduce((dataMap, metric) => {
-    const identifier = buildMetricIdentifier(metric);
-    const timestamp = new Date(metric.flushed_at);
+function aggregateFlushes(flushes) {
+  let flushedAts = [];
+  let metricsMap = new Map();
 
-    if (!dataMap.has(identifier)) {
-      dataMap.set(identifier, []);
+  for (const flush of flushes) {
+    const flushedAt = new Date(flush.flushed_at);
+    flushedAts.push(flushedAt);
+
+    // Aggregate if there are metrics in the flush
+    // NOTE flush.metrics being `[null]` means that no metrics were recorded in the interval
+    // TODO investigate how to return [] instead of [null]
+    if (!(flush.metrics.length === 1 && flush.metrics[0] === null)) {
+      for (const metric of flush.metrics) {
+        const identifier = buildMetricIdentifier(metric);
+
+        // If this is the first time seeing the metric, create the flushed at => value map
+        if (!metricsMap.has(identifier)) {
+          metricsMap.set(identifier, new Map());
+        }
+
+        metricsMap.get(identifier).set(flushedAt, metric.value);
+      }
     }
-    dataMap.get(identifier).push([timestamp, metric.value]);
+  }
 
-    return dataMap;
-  }, new Map());
+  return { flushedAts, metricsMap };
 }
 
-function createChartSeries(liveData) {
-  return Array.from(liveData.entries()).map(([name, data]) => ({
-    type: "line",
-    step: "end",
-    showSymbol: false,
-    name,
-    data,
-  }));
+function createChartSeries(flushedAts, metricsMap) {
+  let series = [];
+  for (const [name, flushedAtMap] of metricsMap) {
+    let data = flushedAts.map((flushedAt) => {
+      const value = flushedAtMap.get(flushedAt) ?? "-";
+      return [flushedAt, value];
+    });
+    series.push({
+      type: "line",
+      step: "end",
+      showSymbol: false,
+      name,
+      data,
+      sampling: "lttb",
+    });
+  }
+
+  return series;
 }
 
-function createChartOptions(series, flushedAtStart, flushedAtEnd) {
+function createChartOptions(flushedAtStart, flushedAtEnd, series) {
   return {
     legend: {
       type: "scroll",
@@ -95,6 +121,7 @@ function createChartOptions(series, flushedAtStart, flushedAtEnd) {
     },
     xAxis: {
       name: "Flushed At",
+      nameLocation: "middle",
       type: "time",
       axisTick: { show: false },
       min: flushedAtStart,
@@ -102,6 +129,7 @@ function createChartOptions(series, flushedAtStart, flushedAtEnd) {
     },
     yAxis: {
       name: "Value",
+      nameLocation: "middle",
       type: "value",
       axisTick: { show: false },
     },
@@ -109,10 +137,11 @@ function createChartOptions(series, flushedAtStart, flushedAtEnd) {
   };
 }
 
-function buildChart(metrics, flushedAtStart, flushedAtEnd) {
-  const liveChart = echarts.init(chartContainer);
-  const liveData = groupMetricsByIdentifier(metrics);
-  const series = createChartSeries(liveData);
-  const chartOptions = createChartOptions(series, flushedAtStart, flushedAtEnd);
-  liveChart.setOption(chartOptions, { notMerge: true });
+function buildChart(flushes, flushedAtStart, flushedAtEnd) {
+  const metricsLineChart = echarts.init(chartContainer);
+  const { flushedAts, metricsMap } = aggregateFlushes(flushes);
+  const series = createChartSeries(flushedAts, metricsMap);
+
+  const chartOptions = createChartOptions(flushedAtStart, flushedAtEnd, series);
+  metricsLineChart.setOption(chartOptions, { notMerge: true });
 }
