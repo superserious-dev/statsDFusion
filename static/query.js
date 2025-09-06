@@ -96,10 +96,20 @@ function createChartSeries(flushedAts, metricsMap) {
     series.push({
       type: "line",
       step: "end",
-      showSymbol: false,
+      symbol: "none",
       name,
       data,
       sampling: "lttb",
+      endLabel: {
+        show: true,
+        formatter: "{a}",
+      },
+      labelLayout: {
+        moveOverlap: "shiftY",
+      },
+      emphasis: {
+        focus: "series",
+      },
     });
   }
 
@@ -116,14 +126,15 @@ function createChartOptions(flushedAtStart, flushedAtEnd, series) {
     tooltip: {
       trigger: "axis",
       axisPointer: {
-        animation: false,
+        type: "cross",
+        snap: true,
       },
     },
     xAxis: {
       name: "Flushed At",
       nameLocation: "middle",
       type: "time",
-      axisTick: { show: false },
+      axisTick: { show: true },
       min: flushedAtStart,
       max: flushedAtEnd,
     },
@@ -131,8 +142,20 @@ function createChartOptions(flushedAtStart, flushedAtEnd, series) {
       name: "Value",
       nameLocation: "middle",
       type: "value",
-      axisTick: { show: false },
+      axisTick: { show: true },
     },
+    dataZoom: [
+      {
+        type: "slider",
+        filterMode: "filter",
+        xAxisIndex: [0],
+      },
+      {
+        type: "slider",
+        filterMode: "filter",
+        yAxisIndex: [0],
+      },
+    ],
     series,
   };
 }
