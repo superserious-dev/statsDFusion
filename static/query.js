@@ -31,9 +31,9 @@ async function query(params) {
 
     if (response.ok) {
       // NOTE incoming data is sorted flushed at ASC
-      const result = await response.json();
-      console.log("Success:", result); // FIXME add visual feedback while chart loading
-      buildChart(result.flushes, flushedAtStart, flushedAtEnd);
+      const flushes = await response.json();
+      console.log("Success:", flushes); // FIXME add visual feedback while chart loading
+      buildChart(flushes, flushedAtStart, flushedAtEnd);
     } else {
       throw new Error(`HTTP Error... status: ${response.status}`);
     }
@@ -67,19 +67,15 @@ function aggregateFlushes(flushes) {
     flushedAts.push(flushedAt);
 
     // Aggregate if there are metrics in the flush
-    // NOTE flush.metrics being `[null]` means that no metrics were recorded in the interval
-    // TODO investigate how to return [] instead of [null]
-    if (!(flush.metrics.length === 1 && flush.metrics[0] === null)) {
-      for (const metric of flush.metrics) {
-        const identifier = buildMetricIdentifier(metric);
+    for (const metric of flush.metrics) {
+      const identifier = buildMetricIdentifier(metric);
 
-        // If this is the first time seeing the metric, create the flushed at => value map
-        if (!metricsMap.has(identifier)) {
-          metricsMap.set(identifier, new Map());
-        }
-
-        metricsMap.get(identifier).set(flushedAt, metric.value);
+      // If this is the first time seeing the metric, create the flushed at => value map
+      if (!metricsMap.has(identifier)) {
+        metricsMap.set(identifier, new Map());
       }
+
+      metricsMap.get(identifier).set(flushedAt, metric.value);
     }
   }
 

@@ -9,6 +9,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder,
+    error::FlightError,
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService, FlightServiceServer},
 };
@@ -53,6 +54,7 @@ const HOT_METRICS_TABLES: [&str; 3] = [
 #[derive(Debug, Deserialize, Serialize)]
 pub enum DoGetQuery {
     NameRegexWithFlushedAtInterval(String, (DateTime<Utc>, DateTime<Utc>)),
+    ListMetrics,
 }
 
 #[derive(Clone)]
@@ -111,6 +113,7 @@ impl InnerFlightServer {
     }
 }
 
+// TODO Review returned Errs and select the most accurate Status variant for each case
 #[tonic::async_trait]
 impl FlightService for InnerFlightServer {
     type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
@@ -163,7 +166,7 @@ impl FlightService for InnerFlightServer {
         let bytes = &request.get_ref().ticket;
         let query: DoGetQuery = serde_json::from_slice(bytes).unwrap();
 
-        let flight_stream = match query {
+        let df = match query {
             DoGetQuery::NameRegexWithFlushedAtInterval(
                 mut name_regex,
                 (flushed_at_start, flushed_at_end),
@@ -176,7 +179,7 @@ impl FlightService for InnerFlightServer {
                     name_regex.push('$');
                 }
 
-                let df = self
+                self
                     .ctx
                     .sql(&format!(
                         "
@@ -237,20 +240,50 @@ impl FlightService for InnerFlightServer {
                         ),
                         ("name_regex", ScalarValue::from(name_regex)),
                     ])
-                    .map_err(|e| Status::unknown(e.to_string()))?;
+                    .map_err(|e| Status::unknown(e.to_string()))?
+            }
+            DoGetQuery::ListMetrics => {
+                // FIXME this currently does a full-history scan; implement an indexing strategy for this
+                self
+                    .ctx
+                    .sql(&format!(
+                        "
+                        WITH metrics AS (
+                            SELECT *
+                            FROM (
+                                SELECT flushed_at, name, tags
+                                FROM {HOT_METRICS_TABLE_COUNTERS}
 
-                let record_batch_stream = df
-                    .execute_stream()
+                                UNION ALL
+
+                                SELECT flushed_at, name, tags
+                                FROM {HOT_METRICS_TABLE_GAUGES}
+                            )
+                        )
+                        SELECT name, tags, min_flushed_at, max_flushed_at, measurement_count
+                        FROM (
+                            -- NOTE tried a few different approaches to grouping by (name, tags) and this worked
+                            SELECT name, MAP_KEYS(tags), MAP_VALUES(tags), FIRST_VALUE(tags) AS tags, MIN(flushed_at) AS min_flushed_at, MAX(flushed_at) AS max_flushed_at, COUNT(*) AS measurement_count
+                            FROM metrics
+                            GROUP BY name, MAP_KEYS(tags), MAP_VALUES(tags)
+                        )
+                        ORDER BY name, MAP_KEYS(tags), MAP_VALUES(tags)
+                        "
+                    ))
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .map(|s| {
-                        s.map_err(|e| arrow_flight::error::FlightError::ExternalError(e.into()))
-                    });
-                FlightDataEncoderBuilder::new()
-                    .build(record_batch_stream)
-                    .map_err(|e| Status::internal(e.to_string()))
+                    .map_err(|e| Status::unknown(e.to_string()))?
             }
         };
+
+        let record_batch_stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map(|s| s.map_err(|e| FlightError::ExternalError(e.into())));
+
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .build(record_batch_stream)
+            .map_err(|e| Status::internal(e.to_string()));
 
         let response = Response::new(Box::pin(flight_stream) as Self::DoGetStream);
         Ok(response)

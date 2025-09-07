@@ -60,6 +60,7 @@ impl Service for HttpServer {
             let listener = TcpListener::bind(http_socket_addr).await?;
             let router = Router::new()
                 .route("/", get(routes::history))
+                .route("/metrics", get(routes::metrics))
                 .route("/query", get(routes::query))
                 .nest_service("/static", ServeDir::new("static/"))
                 .with_state(Arc::new(http_server_state));
@@ -96,7 +97,7 @@ impl HttpServerService for HttpServer {}
 mod routes {
     use crate::{http_server::HttpServerState, metrics_store::DoGetQuery};
     use anyhow::{anyhow, bail};
-    use arrow_flight::Ticket;
+    use arrow_flight::{FlightClient, Ticket};
     use axum::{
         Json,
         extract::{Query, State},
@@ -110,14 +111,10 @@ mod routes {
     };
     use futures::TryStreamExt as _;
     use maud::{DOCTYPE, html};
-    use serde::{Deserialize, Serialize};
-    use serde_json::Value;
-    use std::sync::Arc;
-
-    #[derive(Debug, Serialize)]
-    pub(crate) struct HistoryResponse {
-        flushes: Value,
-    }
+    use serde::{Deserialize, Serialize, Serializer};
+    use std::fmt::Debug;
+    use std::{collections::BTreeMap, sync::Arc};
+    use tokio::sync::Mutex;
 
     #[derive(Debug, Deserialize)]
     pub(crate) struct QueryParams {
@@ -170,7 +167,123 @@ mod routes {
         )
     }
 
-    fn recordbatches_to_json(batches: &[RecordBatch]) -> anyhow::Result<serde_json::Value> {
+    pub(crate) async fn metrics(
+        State(state): State<Arc<HttpServerState>>,
+    ) -> Result<impl IntoResponse, (StatusCode, String)> {
+        #[derive(Debug, Deserialize)]
+        struct ListMetrics {
+            name: String,
+            tags: BTreeMap<String, Option<String>>,
+            min_flushed_at: DateTime<Utc>,
+            max_flushed_at: DateTime<Utc>,
+            measurement_count: u128,
+        }
+
+        let metrics =
+            fetch_do_get_as_type::<Vec<ListMetrics>>(&state.flight_client, DoGetQuery::ListMetrics)
+                .await?;
+
+        let tags2string = |tags: BTreeMap<String, Option<String>>| -> String {
+            tags.iter()
+                .map(|(k, v)| match v {
+                    Some(val) => format!("{}={}", k, val),
+                    None => k.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let body = html! {
+            (DOCTYPE)
+            link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.indigo.min.css";
+
+            body {
+                main."container-fluid" {
+
+                    table {
+                        thead {
+                            tr {
+                                th scope = "col" {"Name"}
+                                th scope = "col" {"Tags"}
+                                th scope = "col" {"First Seen"}
+                                th scope = "col" {"Last Seen"}
+                                th scope = "col" {"# of Measurements"}
+                            }
+                        }
+                        tbody {
+                            @for metric in metrics {
+                                tr {
+                                    th scope = "row" {(metric.name)}
+                                    td {(tags2string(metric.tags))}
+                                    // FIXME improve timezone handling
+                                    td {(metric.min_flushed_at.format("%m-%d-%y %H:%M:%S %Z").to_string())}
+                                    td {(metric.max_flushed_at.format("%m-%d-%y %H:%M:%S %Z").to_string())}
+                                    td {(metric.measurement_count)}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let response = (
+            [
+                ("Cache-Control", "no-store, must-revalidate"),
+                ("Content-Type", "text/html"),
+            ],
+            body.into_string(),
+        );
+        Ok(response)
+    }
+
+    pub(crate) async fn query(
+        State(state): State<Arc<HttpServerState>>,
+        Query(params): Query<QueryParams>,
+    ) -> Result<impl IntoResponse, (StatusCode, String)> {
+        let query = DoGetQuery::NameRegexWithFlushedAtInterval(
+            params.name_regex,
+            (params.flushed_at_start, params.flushed_at_end),
+        );
+
+        fn serialize_optional_vec<S>(
+            vec: &Vec<Option<HistoryMetric>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let output = if vec.len() == 1 && vec[0].is_none() {
+                &vec![]
+            } else {
+                vec
+            };
+            output.serialize(serializer)
+        }
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct HistoryMetric {
+            name: String,
+            tags: BTreeMap<String, Option<String>>,
+            value: f64,
+        }
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct Flush {
+            flushed_at: DateTime<Utc>,
+            // custom serializer deals with a quirk in the upstream query
+            // TODO investigate ways to improve this
+            #[serde(serialize_with = "serialize_optional_vec")]
+            metrics: Vec<Option<HistoryMetric>>,
+        }
+
+        let flushes = fetch_do_get_as_type::<Vec<Flush>>(&state.flight_client, query).await?;
+
+        Ok(Json(flushes))
+    }
+
+    fn recordbatches_as_type<T: serde::de::DeserializeOwned + Debug + Default>(
+        batches: &[RecordBatch],
+    ) -> anyhow::Result<T> {
         if !batches.is_empty() {
             let buf = Vec::new();
             let mut writer = WriterBuilder::new()
@@ -179,51 +292,56 @@ mod routes {
             let batch_refs: Vec<&_> = batches.iter().collect();
 
             if let Err(e) = writer.write_batches(&batch_refs) {
-                bail!("Failed to write batches: {e}");
+                bail!(e);
             }
 
             if let Err(e) = writer.finish() {
-                bail!("Failed to finish writer: {e}");
+                bail!(e);
             }
 
             serde_json::from_slice(&writer.into_inner()).map_err(|e| anyhow!(e.to_string()))
         } else {
-            Ok(serde_json::Value::Array(vec![]))
+            Ok(T::default())
         }
     }
 
-    pub(crate) async fn query(
-        State(state): State<Arc<HttpServerState>>,
-        Query(params): Query<QueryParams>,
-    ) -> impl IntoResponse {
-        let query = DoGetQuery::NameRegexWithFlushedAtInterval(
-            params.name_regex,
-            (params.flushed_at_start, params.flushed_at_end),
-        );
+    async fn fetch_do_get_as_type<T: serde::de::DeserializeOwned + Debug + Default>(
+        flight_client: &Mutex<FlightClient>,
+        query: DoGetQuery,
+    ) -> Result<T, (StatusCode, String)> {
         let serialized: Vec<u8> = serde_json::to_vec(&query).unwrap();
         let ticket = Ticket::new(serialized);
 
-        match state.flight_client.lock().await.do_get(ticket).await {
-            Ok(record_batch_stream) => match record_batch_stream.try_collect::<Vec<_>>().await {
-                Ok(batches) => match recordbatches_to_json(&batches) {
-                    Ok(flushes) => {
-                        let response = HistoryResponse { flushes };
-                        Json(response).into_response()
-                    }
-                    Err(e) => {
-                        log::error!("Error parsing batches: {e}");
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    }
-                },
-                Err(e) => {
-                    log::error!("Error collecting batches: {e}");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
-            },
-            Err(e) => {
-                log::error!("Flight client error: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        }
+        let ticket_result = flight_client.lock().await.do_get(ticket).await;
+        let Ok(batch_stream) = ticket_result else {
+            let error = ticket_result.unwrap_err().to_string();
+            log::error!("{error}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to fetch ticket results".to_string(),
+            ));
+        };
+
+        let batches_result = batch_stream.try_collect::<Vec<_>>().await;
+        let Ok(batches) = batches_result else {
+            let error = batches_result.unwrap_err().to_string();
+            log::error!("{error}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to extract record batches from stream".to_string(),
+            ));
+        };
+
+        let typed_value_result = recordbatches_as_type::<T>(&batches);
+        let Ok(typed_value) = typed_value_result else {
+            let error = typed_value_result.unwrap_err().to_string();
+            log::error!("{error}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to convert record batches to JSON value".to_string(),
+            ));
+        };
+
+        Ok(typed_value)
     }
 }
